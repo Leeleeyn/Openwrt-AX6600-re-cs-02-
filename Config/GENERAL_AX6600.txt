@@ -101,7 +101,7 @@ CONFIG_PACKAGE_kmod-md-mod=y
 CONFIG_PACKAGE_kmod-md-raid0=y
 CONFIG_PACKAGE_kmod-md-raid1=y
 CONFIG_PACKAGE_kmod-md-raid10=y
-
+CONFIG_PACKAGE_kmod-sched-bpf=y
 # iPhone USB 共享
 CONFIG_PACKAGE_kmod-usb-net-ipheth=n
 CONFIG_PACKAGE_kmod-usb-net-qmi-wwan=y
