@@ -22,7 +22,7 @@ CONFIG_PACKAGE_luci-app-ksmbd=n
 CONFIG_PACKAGE_luci-app-nlbwmon=y
 CONFIG_PACKAGE_luci-app-vlmcsd=y
 
-#20260811增加
+# 20260811增加
 CONFIG_PACKAGE_zram-swap=y
 CONFIG_PACKAGE_kmod-lib-lz4=y
 CONFIG_KERNEL_ZRAM_BACKEND_LZ4=y
@@ -101,6 +101,7 @@ CONFIG_PACKAGE_kmod-md-mod=y
 CONFIG_PACKAGE_kmod-md-raid0=y
 CONFIG_PACKAGE_kmod-md-raid1=y
 CONFIG_PACKAGE_kmod-md-raid10=y
+ #daed安装所需依赖
 CONFIG_PACKAGE_kmod-sched-bpf=y
 # iPhone USB 共享
 CONFIG_PACKAGE_kmod-usb-net-ipheth=n
@@ -131,7 +132,7 @@ CONFIG_PACKAGE_perl=n
 CONFIG_PACKAGE_libopenssl=y
 CONFIG_PACKAGE_libopenssl-conf=y
 CONFIG_PACKAGE_iptasn=y
-# U 盘自动挂载
+# U盘自动挂载
 CONFIG_PACKAGE_automount=y
 CONFIG_PACKAGE_blkid=y
 CONFIG_PACKAGE_cfdisk=y
@@ -166,7 +167,7 @@ CONFIG_PACKAGE_usb-modeswitch=y
 CONFIG_PACKAGE_usbmuxd=n
 CONFIG_PACKAGE_usbutils=y
 
-# 雅典娜 LED 点阵屏驱动及插件
+# 雅典娜LED点阵屏驱动及插件
 #CONFIG_PACKAGE_luci-app-athena-led=n
 #CONFIG_PACKAGE_athena-led-control=n
 
