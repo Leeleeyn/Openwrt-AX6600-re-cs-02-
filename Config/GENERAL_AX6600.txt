@@ -104,6 +104,9 @@ CONFIG_PACKAGE_kmod-md-mod=y
 CONFIG_PACKAGE_kmod-md-raid0=y
 CONFIG_PACKAGE_kmod-md-raid1=y
 CONFIG_PACKAGE_kmod-md-raid10=y
+# 20260831增加
+CONFIG_PACKAGE_kmod-lp=y
+CONFIG_PACKAGE_kmod-usb-printer=y
  #daed安装所需依赖
 CONFIG_PACKAGE_kmod-sched-bpf=y
 # iPhone USB 共享
