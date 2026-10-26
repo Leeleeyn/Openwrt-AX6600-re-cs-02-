@@ -1,7 +1,7 @@
-# 🚀 OpenWrt AX6600 / IPQ60xx Router Firmware (Cloud Build + NSS Acceleration)
+# 🚀 OpenWrt AX6600 / IPQ60xx Router Firmware (Cloud Build + PPE Acceleration)
 
-OpenWrt / AX6600 / IPQ6010 / JDCloud RE-CS-02 / NSS / Router Firmware / Cloud Build
-> 基于 OpenWrt / ImmortalWrt 的定制固件，适配 JDCloud RE-CS-02（京东云雅典娜 AX6600），集成 NSS 硬件加速优化与 GitHub Actions 自动云编译
+OpenWrt / AX6600 / IPQ6010 / JDCloud RE-CS-02 / PPE / Router Firmware / Cloud Build
+> 基于 OpenWrt / ImmortalWrt 的定制固件，适配 JDCloud RE-CS-02（京东云雅典娜 AX6600），全面迁移至 Linux 6.18 LTS 内核，集成 Qualcomm PPE 开源硬件加速、SONiC FullCone NAT1 与 GitHub Actions 极速云编译
 
 [![Stars](https://img.shields.io/github/stars/ones20250/Openwrt-AX6600?style=flat&logo=github&label=Stars)](https://github.com/ones20250/Openwrt-AX6600/stargazers)
 [![Downloads](https://img.shields.io/github/downloads/ones20250/Openwrt-AX6600/total?logo=github&label=%E4%B8%8B%E8%BD%BD%E9%87%8F)](https://github.com/ones20250/Openwrt-AX6600/releases)
@@ -13,14 +13,16 @@ OpenWrt / AX6600 / IPQ6010 / JDCloud RE-CS-02 / NSS / Router Firmware / Cloud Bu
 
 ## ⭐ 项目特点
 
-- 🔥 **云编译构建** - 基于 GitHub Actions 完全自动化编译
+- 🔥 **云编译构建** - 基于 GitHub Actions 完全自动化极速编译（宿主工具穿透与缓存优化）
 - 📦 **官方支持** - 完美适配京东云雅典娜AX6600（RE-CS-02）
-- 💡 **点阵屏控制** - 内置雅典娜 LED 点阵屏驱动与管理界面（athena-led）
-- 🚀 **开箱即用** - 预装常用网络工具与插件
-- ⚡ **硬件加速** - 原生支持 NSS 硬件加速引擎
+- 🐧 **全新内核** - 全面迁移至 Linux 6.18 LTS 内核与 firewall4 架构
+- ⚡ **硬件加速** - Qualcomm PPE 开源硬件加速 + Linux 原生 Flowtable 硬件卸载
+- 🎯 **全锥 NAT** - 原生 SONiC FullCone NAT1，游戏联机与 P2P 穿透无阻
+- ❄️ **低温运行** - 移除 NSS 闭源高发热组件，待机温度显著降低 5~10℃
+- 💡 **点阵屏控制** - 内置雅典娜 LED 点阵屏官方驱动与管理界面（athena-led）
+- 🚀 **开箱即用** - 预装常用网络工具与自选核心插件（Docker / PassWall2 / OpenClash）
 - 📶 **WiFi 稳定** - 无线驱动内存与系统水位线深度调优，7×24 高负载久跑不断流
-- 🌐 **性能优化** - 显著提升 NAT/转发/吞吐性能
-- 🔄 **源码同步** - 自动跟进 OpenWrt/ImmortalWrt 最新上游
+- 🔄 **源码同步** - 自动跟进 OpenWrt/ImmortalWrt 最新上游 owrt 分支
 - 🧩 **灵活定制** - 支持自定义编译配置和插件
 
 ---
@@ -78,6 +80,12 @@ Releases 页面每个版本包含以下文件（PURE 与 PLUS 分开发布，Rel
 ---
 
 ## 🛠️ 刷机指南
+
+> [!IMPORTANT]
+> ### 架构升级与首次迁移刷机建议
+> 本次迁移全面切换至 **Qualcomm PPE 开源硬件加速** 架构，并修正了 LuCI 防火墙管理界面包名（启用内嵌于 firewall4 的 SONiC FullCone NAT1）。
+> 若从旧版或 NSS 固件升级，由于网络驱动与硬件流表架构发生变动，残留的旧版网络与 NSS 配置存在兼容性风险。
+> **建议首次迁移升级时备份后不保留配置**（Web 升级取消勾选“保留配置”，SSH 命令行执行 `sysupgrade -n 固件文件名.bin`），待进入系统确认正常后再重新配置网络。
 
 > ⚠️ **重要提示：** 以下操作涉及 U-Boot 和分区修改，**请务必先备份重要数据**，谨慎操作！
 
@@ -239,12 +247,14 @@ Releases 页面每个版本包含以下文件（PURE 与 PLUS 分开发布，Rel
 
 | 特性 | 原厂固件 | 本项目固件 |
 |------|---------|----------|
-| **OpenWrt 版本** | 不支持 | ✅ 最新版 |
-| **NSS 硬件加速** | ⚠️ 部分支持 | ✅ 完全支持 |
-| **网络性能** | 基础 | ✅ 优化增强 |
-| **自定义插件** | ❌ 不支持 | ✅ 完全支持 |
-| **定期更新** | ❌ 不定期 | ✅ 自动更新 |
-| **开源透明** | ❌ 闭源 | ✅ 开源公开 |
+| **OpenWrt 版本** | 不支持 | ✅ Linux 6.18 LTS / firewall4 |
+| **硬件加速** | ⚠️ 原厂闭源 NSS 架构 | ✅ Qualcomm PPE 开源硬件加速 + Flowtable 硬件卸载（免除 NSS 闭源微码常驻开销） |
+| **NAT 模式** | 普通锥型 NAT | ✅ 原生 SONiC FullCone NAT1（集成于 firewall4） |
+| **网络性能** | 基础 | ✅ 千兆 / 2.5G 双工硬件流表卸载（支持常见单向/双向流卸载） |
+| **自定义插件** | ❌ 不支持 | ✅ 完全支持（Docker / PassWall2 / OpenClash 开箱即用） |
+| **构建速度** | ❌ 慢 | ✅ CI 宿主工具穿透与预编译优化（跳过 Go/Rust 引导工具链源码编译） |
+| **定期更新** | ❌ 不定期 | ✅ 自动跟进上游 owrt 分支云编译 |
+| **开源透明** | ❌ 闭源 | ✅ 全开源公开 |
 
 ---
 

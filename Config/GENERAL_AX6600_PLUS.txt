@@ -17,7 +17,6 @@ CONFIG_PACKAGE_kmod-nf-nat6=y
 CONFIG_PACKAGE_kmod-nft-nat=y
 CONFIG_PACKAGE_kmod-nft-offload=y
 CONFIG_PACKAGE_kmod-nft-compat=y
-CONFIG_PACKAGE_kmod-nft-fullcone=y
 
 # PassWall2（sing-box/xray 双核心，PassWall 一代的官方继任，选项均与 Makefile 逐一核对过）
 CONFIG_PACKAGE_luci-app-passwall2=y
