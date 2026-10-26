@@ -243,7 +243,8 @@ jobs:
           $GITHUB_WORKSPACE/Scripts/Settings.sh
           $GITHUB_WORKSPACE/.github/scripts/prepare-build-host.sh
 
-          make defconfig -j$(nproc) && make clean -j$(nproc)
+          make defconfig -j$(nproc)
+          make clean -j$(nproc)
 
           echo "=== 正在执行 .config 配置断言校验 ==="
           FAIL=0
