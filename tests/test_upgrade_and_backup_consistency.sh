@@ -133,14 +133,17 @@ chmod +x "$TMP_DIR/uci"
     export PATH="$TMP_DIR:$PATH"
     export UCI_CONFIG_FILE="$MOCK_CONFIG"
     if uci -q get firewall.qcanssecm >/dev/null; then
+        SEC_TYPE=$(uci -q get firewall.qcanssecm || true)
         SCRIPT_PATH=$(uci -q get firewall.qcanssecm.path || true)
-        case "$SCRIPT_PATH" in
-            *nss*|*ecm*|"")
-                echo "Found firewall.qcanssecm, deleting..."
-                uci delete firewall.qcanssecm
-                uci commit firewall
-                ;;
-        esac
+        if [ "$SEC_TYPE" = "include" ]; then
+            case "$SCRIPT_PATH" in
+                /etc/firewall.d/qca-nss-ecm|/etc/firewall.d/qca-nss|/etc/firewall.nss)
+                    echo "Found legacy NSS include firewall.qcanssecm, deleting..."
+                    uci delete firewall.qcanssecm
+                    uci commit firewall
+                    ;;
+            esac
+        fi
     fi
 )
 
@@ -159,7 +162,36 @@ if ! grep -q "config redirect 'user_port_forward'" "$MOCK_CONFIG"; then
     echo "FAIL: user redirect 'user_port_forward' was erroneously deleted!" >&2
     exit 1
 fi
-echo "PASS: NSS cleanup successfully removed only the legacy section and preserved user rules."
+
+# Verify negative case: same-name rule is NOT deleted
+cat << 'EOF' > "$MOCK_CONFIG"
+config rule 'qcanssecm'
+	option name 'Allow-Custom-qcanssecm'
+	option target 'ACCEPT'
+EOF
+
+(
+    export PATH="$TMP_DIR:$PATH"
+    export UCI_CONFIG_FILE="$MOCK_CONFIG"
+    if uci -q get firewall.qcanssecm >/dev/null; then
+        SEC_TYPE=$(uci -q get firewall.qcanssecm || true)
+        SCRIPT_PATH=$(uci -q get firewall.qcanssecm.path || true)
+        if [ "$SEC_TYPE" = "include" ]; then
+            case "$SCRIPT_PATH" in
+                /etc/firewall.d/qca-nss-ecm|/etc/firewall.d/qca-nss|/etc/firewall.nss)
+                    uci delete firewall.qcanssecm
+                    uci commit firewall
+                    ;;
+            esac
+        fi
+    fi
+)
+
+if ! grep -q "config rule 'qcanssecm'" "$MOCK_CONFIG"; then
+    echo "FAIL: rule with same name 'qcanssecm' was mistakenly deleted!" >&2
+    exit 1
+fi
+echo "PASS: NSS cleanup successfully removed only the legacy include and preserved all user rules."
 
 # Test 4: Helper script executable test
 echo "--- Test 4: Verify docker_upgrade_helper.sh is valid ---"
