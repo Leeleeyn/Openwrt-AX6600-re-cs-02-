@@ -87,23 +87,44 @@ case "$cmd" in
                 *"Config.Image"*)
                     cat "$MOCK_STATE/cimg_$cid" 2>/dev/null || echo "alpine:latest"
                     ;;
+                *"NetworkSettings.Networks"*)
+                    cat "$MOCK_STATE/net_count_$cid" 2>/dev/null || echo "1"
+                    ;;
+                *"HostConfig.NetworkMode"*)
+                    cat "$MOCK_STATE/cnet_$cid" 2>/dev/null || echo "bridge"
+                    ;;
+                *"RestartPolicy.Name"*)
+                    cat "$MOCK_STATE/crestart_$cid" 2>/dev/null || echo "unless-stopped"
+                    ;;
                 *"Name"*)
                     cat "$MOCK_STATE/cname_$cid" 2>/dev/null || echo "/$cid"
                     ;;
-                *"NetworkMode"*)
-                    echo "bridge"
-                    ;;
-                *"RestartPolicy.Name"*)
-                    echo "unless-stopped"
-                    ;;
                 *"Privileged"*)
-                    echo "false"
+                    cat "$MOCK_STATE/cpriv_$cid" 2>/dev/null || echo "false"
                     ;;
-                *"Binds"*)
+                *"Config.User"*)
+                    cat "$MOCK_STATE/cuser_$cid" 2>/dev/null || echo ""
+                    ;;
+                *"Config.WorkingDir"*)
+                    cat "$MOCK_STATE/cworkdir_$cid" 2>/dev/null || echo ""
+                    ;;
+                *"Config.Hostname"*)
+                    cat "$MOCK_STATE/chostname_$cid" 2>/dev/null || echo ""
+                    ;;
+                *"Config.Entrypoint"*)
+                    cat "$MOCK_STATE/centrypoint_$cid" 2>/dev/null || echo ""
+                    ;;
+                *"PortBindings"*)
+                    cat "$MOCK_STATE/cports_$cid" 2>/dev/null || cat "$MOCK_STATE/ports_$cid" 2>/dev/null || true
+                    ;;
+                *"Config.Env"*)
+                    cat "$MOCK_STATE/cenvs_$cid" 2>/dev/null || cat "$MOCK_STATE/env_$cid" 2>/dev/null || echo "MYSQL_ROOT_PASSWORD=my_secret_pass_123"
+                    ;;
+                *"HostConfig.Binds"*)
                     cat "$MOCK_STATE/binds_$cid" 2>/dev/null || true
                     ;;
-                *"Env"*)
-                    echo "MYSQL_ROOT_PASSWORD=my_secret_pass_123"
+                *"Config.Cmd"*)
+                    cat "$MOCK_STATE/ccmd_$cid" 2>/dev/null || cat "$MOCK_STATE/cmd_$cid" 2>/dev/null || echo ""
                     ;;
                 *)
                     echo ""
@@ -150,6 +171,10 @@ case "$cmd" in
             exit 1
         fi
         echo "$*" >> "$MOCK_STATE/stopped_containers.log"
+        if [ -f "$MOCK_STATE/simulate_stop_data_flush" ]; then
+            flush_target=$(cat "$MOCK_STATE/simulate_stop_data_flush")
+            echo "post_stop_flushed_cold_data" > "$flush_target"
+        fi
         exit 0
         ;;
     run)
@@ -226,6 +251,15 @@ chmod +x "$MOCK_BIN/docker-compose"
 cat << 'EOF' > "$MOCK_BIN/df"
 #!/bin/sh
 echo "df $*" >> "$MOCK_STATE/invocations.log"
+target=""
+for arg; do
+    target="$arg"
+done
+if [ -f "$MOCK_STATE/df_overlay_all" ] || [ -f "$MOCK_STATE/unmounted_$target" ] || echo "$target" | grep -q "unmounted"; then
+    echo "Filesystem     1024-blocks   Used Available Capacity Mounted on"
+    echo "overlayfs:/overlay 1048576 524288    524288      50% /"
+    exit 0
+fi
 mode=$(cat "$MOCK_STATE/df_mode" 2>/dev/null || echo "usb")
 case "$mode" in
     overlay)
@@ -257,27 +291,59 @@ case "$mode" in
     dual_small_target)
         # rootfs 是 60MB (122880 sectors)，rootfs_1 是 512MB (1048576 sectors)
         echo "Disk /dev/mmcblk0: 58.2 GiB"
-        echo "/dev/mmcblk0p15       40960      163839      122880   rootfs"
-        echo "/dev/mmcblk0p16      163840     1212415     1048576   rootfs_1"
+        echo "/dev/mmcblk0p2          2048        2559         512   0:BOOTCONFIG"
+        echo "/dev/mmcblk0p13         2560       35327       32768   0:HLOS"
+        echo "/dev/mmcblk0p14        35328       68095       32768   0:HLOS_1"
+        echo "/dev/mmcblk0p15        68096      190975      122880   rootfs"
+        echo "/dev/mmcblk0p16       190976     1239551     1048576   rootfs_1"
         ;;
     dual_large_both)
         echo "Disk /dev/mmcblk0: 58.2 GiB"
-        echo "/dev/mmcblk0p15       40960     1089535     1048576   rootfs"
-        echo "/dev/mmcblk0p16     1089536     2138111     1048576   rootfs_1"
+        echo "/dev/mmcblk0p2          2048        2559         512   0:BOOTCONFIG"
+        echo "/dev/mmcblk0p13         2560       35327       32768   0:HLOS"
+        echo "/dev/mmcblk0p14        35328       68095       32768   0:HLOS_1"
+        echo "/dev/mmcblk0p15        68096     1116671     1048576   rootfs"
+        echo "/dev/mmcblk0p16      1116672     2165247     1048576   rootfs_1"
         ;;
     missing_partitions)
         echo "Disk /dev/mmcblk0: 58.2 GiB"
-        echo "/dev/mmcblk0p1       2048       4095        2048   boot"
+        echo "/dev/mmcblk0p1          2048        4095        2048   boot"
         ;;
     *)
         echo "Disk /dev/mmcblk0: 58.2 GiB"
-        echo "/dev/mmcblk0p15       40960     1089535     1048576   rootfs"
-        echo "/dev/mmcblk0p16     1089536     2138111     1048576   rootfs_1"
+        echo "/dev/mmcblk0p2          2048        2559         512   0:BOOTCONFIG"
+        echo "/dev/mmcblk0p13         2560       35327       32768   0:HLOS"
+        echo "/dev/mmcblk0p14        35328       68095       32768   0:HLOS_1"
+        echo "/dev/mmcblk0p15        68096     1116671     1048576   rootfs"
+        echo "/dev/mmcblk0p16      1116672     2165247     1048576   rootfs_1"
         ;;
 esac
 exit 0
 EOF
 chmod +x "$MOCK_BIN/fdisk"
+
+cat << 'EOF' > "$MOCK_BIN/hexdump"
+#!/bin/sh
+echo "hexdump $*" >> "$MOCK_STATE/invocations.log"
+target=""
+for arg; do
+    target="$arg"
+done
+if [ -f "$target" ]; then
+    od_hex=$(od -An -tx1 -N 1 -j 148 "$target" 2>/dev/null | awk '{print $1}' || echo "00")
+    if [ "$od_hex" = "01" ]; then
+        echo "1|"
+    elif [ "$od_hex" = "00" ]; then
+        echo "0|"
+    else
+        echo "0|"
+    fi
+else
+    echo "0|"
+fi
+exit 0
+EOF
+chmod +x "$MOCK_BIN/hexdump"
 
 cat << 'EOF' > "$MOCK_BIN/sysupgrade"
 #!/bin/sh
@@ -292,7 +358,9 @@ chmod +x "$MOCK_BIN/sysupgrade"
 cat << 'EOF' > "$MOCK_BIN/nft"
 #!/bin/sh
 echo "nft $*" >> "$MOCK_STATE/invocations.log"
-if [ -f "$MOCK_STATE/nft_has_flowtable" ]; then
+if [ -f "$MOCK_STATE/nft_has_flowtable_hw" ]; then
+    echo "table inet fw4 { flowtable ft { hook ingress priority 0; devices = { eth0 }; flags = { hw_offload }; } }"
+elif [ -f "$MOCK_STATE/nft_has_flowtable_sw" ] || [ -f "$MOCK_STATE/nft_has_flowtable" ]; then
     echo "table inet fw4 { flowtable ft { hook ingress priority 0; devices = { eth0 }; } }"
 else
     echo "table inet fw4 { chain forward { type filter hook forward priority 0; drop; } }"
@@ -590,7 +658,7 @@ echo "--- 测试 3: 外盘未挂载或位于 /overlay / tmpfs 时严格拒绝 --
         echo "FAIL: 目标在 /overlay 上却没有拦截！"
         exit 1
     fi
-    if ! grep -q "位于根文件系统或 /overlay" "$TEST_SANDBOX/t3.log" && ! grep -q "存储设备为易失或升级重置设备" "$TEST_SANDBOX/t3.log"; then
+    if ! grep -qiE "(位于根文件系统或.*overlay|存储设备为易失或升级重置设备)" "$TEST_SANDBOX/t3.log"; then
         echo "FAIL: 未能正确识别 /overlay: $(cat "$TEST_SANDBOX/t3.log")"
         exit 1
     fi
@@ -705,10 +773,16 @@ echo "--- 测试 7: 端到端隔离备份与完整数据恢复演练 ---"
     EXT_BIND="$SYS_ROOT$ROUTER_BIND"
     ROUTER_COMPOSE="/my_apps/custom_compose_path"
     SRC_COMPOSE="$SYS_ROOT$ROUTER_COMPOSE"
+    SRC_COMPOSE_DATA="$SRC_COMPOSE/data"
 
-    mkdir -p "$SRC_DOCKER/volumes/app_volume" "$DST_DOCKER" "$BKP_STORE" "$EXT_BIND" "$SRC_COMPOSE"
+    mkdir -p "$SRC_DOCKER/volumes/app_volume" "$DST_DOCKER" "$BKP_STORE" "$EXT_BIND/data" "$SRC_COMPOSE_DATA"
     echo "important_vol_data_99" > "$SRC_DOCKER/volumes/app_volume/data.bin"
     echo "bind_config_val=1" > "$EXT_BIND/app.env"
+    echo "bind_sub_val=2" > "$EXT_BIND/data/sub.txt"
+    echo "pre_stop_compose_data" > "$SRC_COMPOSE_DATA/state.txt"
+
+    # 设置停机冷数据落盘模拟：停机时容器落盘更新数据，确保冷备归档抓取到最新持久化数据
+    echo "$SRC_COMPOSE_DATA/state.txt" > "$MOCK_STATE/simulate_stop_data_flush"
 
     # 创建 Compose 项目（必须包含 .env 隐藏文件）
     cat << 'EOF' > "$SRC_COMPOSE/docker-compose.yml"
@@ -741,7 +815,7 @@ EOF
       }
     },
     "HostConfig": {
-      "Binds": ["$ROUTER_BIND:/app/config"]
+      "Binds": ["$ROUTER_BIND:/app/config", "$ROUTER_COMPOSE/data:/app/data"]
     }
   },
   {
@@ -754,8 +828,8 @@ EOF
     "HostConfig": {
       "NetworkMode": "bridge",
       "RestartPolicy": { "Name": "always" },
-      "Privileged": false,
-      "Binds": []
+      "Privileged": true,
+      "Binds": ["$ROUTER_BIND/data:/data"]
     }
   },
   {
@@ -780,20 +854,31 @@ EOF
     echo "$ROUTER_COMPOSE/docker-compose.yml" > "$MOCK_STATE/comp_config_comp_cid"
     echo "nginx:alpine" > "$MOCK_STATE/cimg_comp_cid"
     echo "web_service" > "$MOCK_STATE/cname_comp_cid"
+    echo -e "$ROUTER_BIND:/app/config\n$ROUTER_COMPOSE/data:/app/data" > "$MOCK_STATE/binds_comp_cid"
 
     echo "redis:alpine" > "$MOCK_STATE/cimg_standalone_cid"
     echo "standalone_app" > "$MOCK_STATE/cname_standalone_cid"
     echo "C /etc/redis.conf" > "$MOCK_STATE/diff_standalone_cid"
+    echo "bridge" > "$MOCK_STATE/cnet_standalone_cid"
+    echo "always" > "$MOCK_STATE/crestart_standalone_cid"
+    echo "true" > "$MOCK_STATE/cpriv_standalone_cid"
+    echo "1000" > "$MOCK_STATE/cuser_standalone_cid"
+    echo "/workspace" > "$MOCK_STATE/cworkdir_standalone_cid"
+    echo "standalone-host" > "$MOCK_STATE/chostname_standalone_cid"
+    echo "/entrypoint.sh" > "$MOCK_STATE/centrypoint_standalone_cid"
+    echo "0.0.0.0:8080:80/tcp" > "$MOCK_STATE/cports_standalone_cid"
+    echo "STANDALONE_SECRET=super_secret_token_456" > "$MOCK_STATE/cenvs_standalone_cid"
+    echo "$ROUTER_BIND/data:/data" > "$MOCK_STATE/binds_standalone_cid"
+    printf 'redis-server\n--protected-mode\nno\n' > "$MOCK_STATE/ccmd_standalone_cid"
 
     echo "mysql:8.0" > "$MOCK_STATE/cimg_mysql_cid"
     echo "mysql_db" > "$MOCK_STATE/cname_mysql_cid"
 
-    # 1. 执行全量备份
+    # 1. 执行全量备份（不传 --skip-stop，走完整真实停机冷备流）
     sh "$HELPER_SCRIPT" backup \
         --docker-dir "$SRC_DOCKER" \
         --target-dir "$BKP_STORE" \
-        --sys-root "$SYS_ROOT" \
-        --skip-stop >/dev/null
+        --sys-root "$SYS_ROOT" >/dev/null
 
     # 验证备份目录自包含 helper 脚本（解决重启后 /tmp 丢失问题）
     if [ ! -x "$BKP_STORE/docker_upgrade_helper.sh" ]; then
@@ -817,20 +902,62 @@ EOF
         exit 1
     fi
 
+    # 验证统一清单 backup_manifest.txt 覆盖所有关键产物
+    if [ ! -f "$BKP_STORE/backup_manifest.txt" ]; then
+        echo "FAIL: 未生成统一备份清单 backup_manifest.txt！"
+        exit 1
+    fi
+    for req_item in "compose/my_proj.tar.gz" "standalone/recreate_standalone_app.sh" "standalone/image_standalone_app.tar" "docker_volumes.tar.gz" "docker_bind_mounts.tar.gz"; do
+        if ! grep -q "$req_item" "$BKP_STORE/backup_manifest.txt"; then
+            echo "FAIL: backup_manifest.txt 缺失项目: $req_item"
+            exit 1
+        fi
+        if ! grep -q "$req_item" "$BKP_STORE/sha256sums.txt"; then
+            echo "FAIL: sha256sums.txt 遗漏项目校验: $req_item"
+            exit 1
+        fi
+    done
+
     # 验证 Compose 备份包含 .env
     tar -tzf "$BKP_STORE/compose/my_proj.tar.gz" | grep -q "\.env" || {
         echo "FAIL: Compose 打包漏掉了隐藏文件 .env！"
         exit 1
     }
 
-    # 验证独立容器生成了重建脚本与镜像
-    if [ ! -f "$BKP_STORE/standalone/recreate_standalone_app.sh" ] || [ ! -f "$BKP_STORE/standalone/image_standalone_app.tar" ]; then
+    # 验证独立容器生成了重建脚本与快照镜像
+    REC_SCRIPT="$BKP_STORE/standalone/recreate_standalone_app.sh"
+    if [ ! -f "$REC_SCRIPT" ] || [ ! -f "$BKP_STORE/standalone/image_standalone_app.tar" ]; then
         echo "FAIL: 独立容器重建脚本或快照镜像未生成！"
         exit 1
     fi
 
+    # 严格校验独立容器重建脚本内容覆盖所有参数: -e, -p, -v, --net, --restart, --privileged, -u, -w, -h, --entrypoint, Cmd
+    REC_CONTENT=$(cat "$REC_SCRIPT")
+    for flag_pat in \
+        '--name "standalone_app"' \
+        '--net "bridge"' \
+        '--restart "always"' \
+        '--privileged' \
+        '-u "1000"' \
+        '-w "/workspace"' \
+        '-h "standalone-host"' \
+        '--entrypoint "/entrypoint.sh"' \
+        '-p "0.0.0.0:8080:80/tcp"' \
+        '-e "STANDALONE_SECRET=super_secret_token_456"' \
+        "-v \"$ROUTER_BIND/data:/data\"" \
+        '"backup-snapshot-standalone_app:latest"' \
+        '"redis-server"' \
+        '"--protected-mode"' \
+        '"no"'; do
+        if ! echo "$REC_CONTENT" | grep -F -q -- "$flag_pat"; then
+            echo "FAIL: 独立容器重建脚本遗漏参数: $flag_pat"
+            echo "重建脚本全文: $REC_CONTENT"
+            exit 1
+        fi
+    done
+
     # 模拟系统升级（清空沙箱内的旧系统配置、删除原 Compose 目录、停止服务）
-    rm -rf "$SRC_COMPOSE" "$EXT_BIND/app.env" "$SYS_ROOT/etc/docker" "$SYS_ROOT/etc/config"
+    rm -rf "$SRC_COMPOSE" "$EXT_BIND" "$SYS_ROOT/etc/docker" "$SYS_ROOT/etc/config"
     mkdir -p "$SYS_ROOT/etc/config"
     touch "$SYS_ROOT/etc/config/dockerd"
     echo "0" > "$SYS_ROOT/etc/dockerd_enabled_flag"
@@ -854,8 +981,8 @@ EOF
     fi
 
     # 验证 Bind Mounts 恢复到原路径
-    if [ ! -f "$EXT_BIND/app.env" ]; then
-        echo "FAIL: Bind Mounts 未恢复到原始宿主路径: $EXT_BIND/app.env"
+    if [ ! -f "$EXT_BIND/app.env" ] || [ ! -f "$EXT_BIND/data/sub.txt" ]; then
+        echo "FAIL: Bind Mounts 未恢复到原始宿主路径！"
         exit 1
     fi
     if [ "$(cat "$EXT_BIND/app.env")" != "bind_config_val=1" ]; then
@@ -873,9 +1000,27 @@ EOF
         exit 1
     fi
 
-    # 验证只拉起了记录的项目，而不是扫描整个 /opt
+    # 验证冷备覆盖顺序：Compose 先解压、Bind Mounts 后解压，确保冷备持久化数据绝不被旧数据覆盖
+    if [ ! -f "$SRC_COMPOSE_DATA/state.txt" ]; then
+        echo "FAIL: Compose 内部挂载数据文件缺失！"
+        exit 1
+    fi
+    if [ "$(cat "$SRC_COMPOSE_DATA/state.txt")" != "post_stop_flushed_cold_data" ]; then
+        echo "FAIL: 恢复后数据未保持停机后的冷备状态（被旧 Compose 覆盖）: $(cat "$SRC_COMPOSE_DATA/state.txt")"
+        exit 1
+    fi
+
+    # 验证只拉起了记录的项目，且启动参数包含 -p、-f 与 --env-file
     if ! grep -q "$SRC_COMPOSE" "$MOCK_STATE/compose_invocations.log"; then
         echo "FAIL: Compose 项目未在原始恢复路径拉起！"
+        exit 1
+    fi
+    if ! grep -q -- "-p my_proj" "$MOCK_STATE/compose_invocations.log"; then
+        echo "FAIL: Compose 启动命令遗漏项目名称参数 (-p)！"
+        exit 1
+    fi
+    if ! grep -q -- "--env-file" "$MOCK_STATE/compose_invocations.log"; then
+        echo "FAIL: Compose 启动命令遗漏环境变量文件参数 (--env-file)！"
         exit 1
     fi
 
@@ -917,26 +1062,48 @@ echo "--- 测试 8: 镜像校验与双分区容量安全预检 ---"
         exit 1
     fi
 
-    # 8b: 双分区目标为 60MB 较小分区时，绝不能被 512MB 误放行
+    # 8b: 0:BOOTCONFIG 偏移 148 为 0 时，目标分区为 0:HLOS 与 rootfs (60MB 较小分区)，绝不能被 512MB 误放行
     echo "dual_small_target" > "$MOCK_STATE/fdisk_mode"
-    echo "root=rootfs_1" > "$SYS_ROOT/proc/cmdline"
+    mkdir -p "$SYS_ROOT/dev"
+    head -c 148 /dev/zero > "$SYS_ROOT/dev/mmcblk0p2"
+    printf '\x00' >> "$SYS_ROOT/dev/mmcblk0p2"
+    head -c 363 /dev/zero >> "$SYS_ROOT/dev/mmcblk0p2"
 
     set +e
     sh "$HELPER_SCRIPT" precheck "$IMG_FILE" "$SHA_EXPECTED" --sys-root "$SYS_ROOT" 2>"$TEST_SANDBOX/t8_part.log"
     ret=$?
     set -e
-    rm -f "$MOCK_STATE/fdisk_mode" "$SYS_ROOT/proc/cmdline"
 
     if [ "$ret" -eq 0 ]; then
         echo "FAIL: 目标分区仅 60MB，刷入 100MB 固件竟然被误放行！"
         exit 1
     fi
-    if ! grep -q "目标分区容量.*不足" "$TEST_SANDBOX/t8_part.log"; then
+    if ! grep -qiE "(目标分区容量.*不足|容量仅为.*小于 200MB 安全阈值)" "$TEST_SANDBOX/t8_part.log"; then
         echo "FAIL: 错误提示不符合预期: $(cat "$TEST_SANDBOX/t8_part.log")"
         exit 1
     fi
 
-    # 8c: 系统只读体检模式验证 (识别固件、硬件型号与分区)
+    # 8c: 0:BOOTCONFIG 偏移 148 为 1 时，目标分区为 0:HLOS_1 与 rootfs_1 (512MB 较大分区)，100MB 固件应当放行
+    head -c 148 /dev/zero > "$SYS_ROOT/dev/mmcblk0p2"
+    printf '\x01' >> "$SYS_ROOT/dev/mmcblk0p2"
+    head -c 363 /dev/zero >> "$SYS_ROOT/dev/mmcblk0p2"
+
+    set +e
+    sh "$HELPER_SCRIPT" precheck "$IMG_FILE" "$SHA_EXPECTED" --sys-root "$SYS_ROOT" >"$TEST_SANDBOX/t8_part_ok.log" 2>&1
+    ret=$?
+    set -e
+    rm -f "$MOCK_STATE/fdisk_mode" "$SYS_ROOT/dev/mmcblk0p2"
+
+    if [ "$ret" -ne 0 ]; then
+        echo "FAIL: 目标分区为 512MB rootfs_1，刷入 100MB 固件却被误拦截: $(cat "$TEST_SANDBOX/t8_part_ok.log")"
+        exit 1
+    fi
+    if ! grep -q "目标根文件系统: \[rootfs_1\]" "$TEST_SANDBOX/t8_part_ok.log"; then
+        echo "FAIL: 未正确选中 rootfs_1 作为目标分区: $(cat "$TEST_SANDBOX/t8_part_ok.log")"
+        exit 1
+    fi
+
+    # 8d: 系统只读体检模式验证 (识别固件、硬件型号与分区)
     echo "DISTRIB_DESCRIPTION='OpenWrt 23.05-SNAPSHOT'" > "$SYS_ROOT/etc/openwrt_release"
     mkdir -p "$SYS_ROOT/tmp/sysinfo"
     echo "JDCloud AX6600 (RE-CS-02)" > "$SYS_ROOT/tmp/sysinfo/model"
@@ -998,9 +1165,9 @@ EOF
 echo "PASS: 测试 9 通过（NSS 清理精准保护自定义规则，备份防火墙配置并清除废弃 include）"
 
 # -----------------------------------------------------------------------------
-# 测试 10: 运行时验收失败分支阻断
+# 测试 10: 运行时验收失败分支阻断与精确参数提取
 # -----------------------------------------------------------------------------
-echo "--- 测试 10: 运行时验收失败阻断 ---"
+echo "--- 测试 10: 运行时验收失败阻断与精准提取 ---"
 (
     # 10a: dmesg 报错且无 flowtable 时必须拦截
     touch "$MOCK_STATE/dmesg_ppe_error"
@@ -1014,7 +1181,39 @@ echo "--- 测试 10: 运行时验收失败阻断 ---"
         exit 1
     fi
 
-    # 10b: Docker 端口映射失败必须拦截
+    # 10b: 仅有纯软件 flowtable 缺乏 hw_offload 硬件卸载标志时必须拦截
+    touch "$MOCK_STATE/nft_has_flowtable_sw"
+    set +e
+    sh "$HELPER_SCRIPT" verify ppe --sys-root "$SYS_ROOT" 2>"$TEST_SANDBOX/t10_ppe_sw.log"
+    ret=$?
+    set -e
+    rm -f "$MOCK_STATE/nft_has_flowtable_sw"
+    if [ "$ret" -eq 0 ]; then
+        echo "FAIL: 纯软件 flowtable 缺乏 hw_offload 标志竟然被放行！"
+        exit 1
+    fi
+    if ! grep -q "缺少 hw_offload 硬件卸载标志" "$TEST_SANDBOX/t10_ppe_sw.log"; then
+        echo "FAIL: 纯软件 flowtable 报错信息不符合预期: $(cat "$TEST_SANDBOX/t10_ppe_sw.log")"
+        exit 1
+    fi
+
+    # 10c: flowtable 包含 hw_offload 且无 dmesg 报错时验证通过
+    touch "$MOCK_STATE/nft_has_flowtable_hw"
+    set +e
+    sh "$HELPER_SCRIPT" verify ppe --sys-root "$SYS_ROOT" >"$TEST_SANDBOX/t10_ppe_hw.log" 2>&1
+    ret=$?
+    set -e
+    rm -f "$MOCK_STATE/nft_has_flowtable_hw"
+    if [ "$ret" -ne 0 ]; then
+        echo "FAIL: PPE 硬件加速 (hw_offload) 验收未通过: $(cat "$TEST_SANDBOX/t10_ppe_hw.log")"
+        exit 1
+    fi
+    if ! grep -q "PPE 硬件加速状态: 已生效" "$TEST_SANDBOX/t10_ppe_hw.log"; then
+        echo "FAIL: PPE 硬件加速成功提示信息异常: $(cat "$TEST_SANDBOX/t10_ppe_hw.log")"
+        exit 1
+    fi
+
+    # 10d: Docker 端口映射失败必须拦截
     touch "$MOCK_STATE/docker_fail_port_mapping"
     set +e
     sh "$HELPER_SCRIPT" verify docker --sys-root "$SYS_ROOT" 2>"$TEST_SANDBOX/t10_docker.log"
@@ -1026,7 +1225,7 @@ echo "--- 测试 10: 运行时验收失败阻断 ---"
         exit 1
     fi
 
-    # 10c: PassWall2 核心未运行必须拦截
+    # 10e: PassWall2 核心未运行必须拦截
     set +e
     sh "$HELPER_SCRIPT" verify passwall --sys-root "$SYS_ROOT" 2>"$TEST_SANDBOX/t10_pw.log"
     ret=$?
@@ -1036,7 +1235,7 @@ echo "--- 测试 10: 运行时验收失败阻断 ---"
         exit 1
     fi
 
-    # 10d: PassWall2 存在运行核心但未找到实际端口配置（禁止盲猜 1080）必须拦截
+    # 10f: PassWall2 存在运行核心但未找到实际端口配置（禁止盲猜 1080）必须拦截
     touch "$MOCK_STATE/pgrep_running_sing-box"
     set +e
     sh "$HELPER_SCRIPT" verify passwall --sys-root "$SYS_ROOT" 2>"$TEST_SANDBOX/t10_pw_port.log"
@@ -1048,7 +1247,7 @@ echo "--- 测试 10: 运行时验收失败阻断 ---"
         exit 1
     fi
 
-    # 10e: PassWall2 存在 TLS 握手报错日志必须拦截
+    # 10g: PassWall2 存在 TLS 握手报错日志必须拦截
     touch "$MOCK_STATE/pgrep_running_sing-box"
     mkdir -p "$SYS_ROOT/var/etc/passwall2"
     echo '{"inbounds":[{"port":1080}]}' > "$SYS_ROOT/var/etc/passwall2/TCP.json"
@@ -1063,7 +1262,7 @@ echo "--- 测试 10: 运行时验收失败阻断 ---"
         exit 1
     fi
 
-    # 10f: PassWall2 配置文件语法错误必须拦截
+    # 10h: PassWall2 配置文件语法错误必须拦截
     touch "$MOCK_STATE/pgrep_running_sing-box"
     touch "$MOCK_STATE/jq_fail"
     set +e
@@ -1075,8 +1274,44 @@ echo "--- 测试 10: 运行时验收失败阻断 ---"
         echo "FAIL: PassWall2 配置文件 JSON 语法错误却放行！"
         exit 1
     fi
+
+    # 10i: PassWall2 配置文件 outbounds 在前且包含远程端口时，必须精准提取 inbounds 本地 socks 端口 (禁止误抓 outbounds 8443)
+    touch "$MOCK_STATE/pgrep_running_sing-box"
+    cat << 'EOF_PW' > "$SYS_ROOT/var/etc/passwall2/TCP.json"
+{
+  "outbounds": [
+    {
+      "type": "shadowsocks",
+      "tag": "proxy-out",
+      "server": "198.51.100.1",
+      "server_port": 8443
+    }
+  ],
+  "inbounds": [
+    {
+      "type": "socks",
+      "tag": "socks-in",
+      "listen": "127.0.0.1",
+      "listen_port": 1080
+    }
+  ]
+}
+EOF_PW
+    set +e
+    sh "$HELPER_SCRIPT" verify passwall --sys-root "$SYS_ROOT" >"$TEST_SANDBOX/t10_pw_inb.log" 2>&1
+    ret=$?
+    set -e
+    rm -f "$MOCK_STATE/pgrep_running_sing-box" "$SYS_ROOT/var/etc/passwall2/TCP.json"
+    if [ "$ret" -ne 0 ]; then
+        echo "FAIL: PassWall2 正确提取 inbounds 端口后握手竟然失败: $(cat "$TEST_SANDBOX/t10_pw_inb.log")"
+        exit 1
+    fi
+    if ! grep -q "定位到活动核心 SOCKS 本地监听端口: 1080" "$TEST_SANDBOX/t10_pw_inb.log"; then
+        echo "FAIL: 未能定位到 1080 或误提取了 8443: $(cat "$TEST_SANDBOX/t10_pw_inb.log")"
+        exit 1
+    fi
 )
-echo "PASS: 测试 10 通过（运行时验收各项失败分支均有效阻断）"
+echo "PASS: 测试 10 通过（运行时验收各项失败分支均有效阻断，inbounds 端口精准提取，硬件 flowtable 校验完整）"
 
 # -----------------------------------------------------------------------------
 # 测试 11: 验证资源清理安全不越界
@@ -1090,4 +1325,204 @@ echo "--- 测试 11: 验证测试沙箱隔离与清理范围 ---"
 )
 echo "PASS: 测试 11 通过（沙箱清理逻辑安全受控）"
 
-echo "=== 全部 11 项深度隔离测试与回归演练已通过！ ==="
+# -----------------------------------------------------------------------------
+# 测试 12: 备份清单篡改与关键文件缺失严格阻断恢复
+# -----------------------------------------------------------------------------
+echo "--- 测试 12: 备份完整性、缺失项与哈希篡改拦截验证 ---"
+(
+    BKP_STORE="$TEST_SANDBOX/bkp_external/docker_bkp"
+    DST_DOCKER="$TEST_SANDBOX/dst_docker"
+    T12_BKP="$TEST_SANDBOX/t12_bkp"
+    rm -rf "$T12_BKP"
+    cp -r "$BKP_STORE" "$T12_BKP"
+
+    # 12a: 关键文件缺失 (删除 docker_volumes.tar.gz) 必须被拦截
+    rm -f "$T12_BKP/docker_volumes.tar.gz"
+    set +e
+    sh "$T12_BKP/docker_upgrade_helper.sh" restore \
+        --backup-dir "$T12_BKP" \
+        --target-data-root "$DST_DOCKER" \
+        --sys-root "$SYS_ROOT" 2>"$TEST_SANDBOX/t12_missing.log"
+    ret=$?
+    set -e
+    if [ "$ret" -eq 0 ]; then
+        echo "FAIL: 缺失 docker_volumes.tar.gz 时恢复竟然放行！"
+        exit 1
+    fi
+    if ! grep -qiE "(关键备份文件缺失|缺少|校验失败)" "$TEST_SANDBOX/t12_missing.log"; then
+        echo "FAIL: 缺失文件报错信息异常: $(cat "$TEST_SANDBOX/t12_missing.log")"
+        exit 1
+    fi
+
+    # 12b: 文件哈希篡改 (篡改 docker_bind_mounts.tar.gz 内容) 必须被 sha256 校验拦截
+    rm -rf "$T12_BKP"
+    cp -r "$BKP_STORE" "$T12_BKP"
+    echo "tampered_corrupted_data" >> "$T12_BKP/docker_bind_mounts.tar.gz"
+    set +e
+    sh "$T12_BKP/docker_upgrade_helper.sh" restore \
+        --backup-dir "$T12_BKP" \
+        --target-data-root "$DST_DOCKER" \
+        --sys-root "$SYS_ROOT" 2>"$TEST_SANDBOX/t12_hash.log"
+    ret=$?
+    set -e
+    if [ "$ret" -eq 0 ]; then
+        echo "FAIL: 备份文件哈希被篡改时恢复竟然放行！"
+        exit 1
+    fi
+    if ! grep -qiE "(sha256|哈希|校验失败)" "$TEST_SANDBOX/t12_hash.log"; then
+        echo "FAIL: 哈希篡改报错信息异常: $(cat "$TEST_SANDBOX/t12_hash.log")"
+        exit 1
+    fi
+
+    # 12c: 清单中记录的 Compose 项目包缺失必须被拦截
+    rm -rf "$T12_BKP"
+    cp -r "$BKP_STORE" "$T12_BKP"
+    rm -f "$T12_BKP/compose/my_proj.tar.gz"
+    set +e
+    sh "$T12_BKP/docker_upgrade_helper.sh" restore \
+        --backup-dir "$T12_BKP" \
+        --target-data-root "$DST_DOCKER" \
+        --sys-root "$SYS_ROOT" 2>"$TEST_SANDBOX/t12_comp_missing.log"
+    ret=$?
+    set -e
+    if [ "$ret" -eq 0 ]; then
+        echo "FAIL: 缺失 Compose 归档时恢复竟然放行！"
+        exit 1
+    fi
+    if ! grep -qiE "(关键备份文件缺失|缺失|校验失败)" "$TEST_SANDBOX/t12_comp_missing.log"; then
+        echo "FAIL: 缺失 Compose 归档报错信息异常: $(cat "$TEST_SANDBOX/t12_comp_missing.log")"
+        exit 1
+    fi
+)
+echo "PASS: 测试 12 通过（备份清单缺失项与哈希篡改均被严格拦截阻断恢复）"
+
+# -----------------------------------------------------------------------------
+# 测试 13: 恢复目标设备挂载安全性校验（DataRoot、Compose 路径、Bind 路径未挂载外部盘严格拦截）
+# -----------------------------------------------------------------------------
+echo "--- 测试 13: 恢复阶段全目标路径挂载安全性核验 ---"
+(
+    BKP_STORE="$TEST_SANDBOX/bkp_external/docker_bkp"
+    DST_DOCKER="$TEST_SANDBOX/dst_docker"
+    T13_BKP="$TEST_SANDBOX/t13_bkp"
+    rm -rf "$T13_BKP"
+    cp -r "$BKP_STORE" "$T13_BKP"
+    mkdir -p "$SYS_ROOT/mnt/unmounted_disk"
+
+    # 13a: TARGET_DATA_ROOT 位于未挂载路径 (fallback 到 overlay /) 时拦截
+    set +e
+    sh "$T13_BKP/docker_upgrade_helper.sh" restore \
+        --backup-dir "$T13_BKP" \
+        --target-data-root "$TEST_SANDBOX/unmounted_external_disk/docker" \
+        --sys-root "$SYS_ROOT" 2>"$TEST_SANDBOX/t13_dataroot.log"
+    ret=$?
+    set -e
+    if [ "$ret" -eq 0 ]; then
+        echo "FAIL: DataRoot 位于未挂载路径恢复竟然放行！"
+        exit 1
+    fi
+    if ! grep -qiE "(位于根文件系统或内部 /overlay|易失或升级重置设备)" "$TEST_SANDBOX/t13_dataroot.log"; then
+        echo "FAIL: DataRoot 挂载安全报错信息异常: $(cat "$TEST_SANDBOX/t13_dataroot.log")"
+        exit 1
+    fi
+
+    # 13b: Compose 项目目标目录位于未挂载路径时拦截
+    rm -rf "$T13_BKP"
+    cp -r "$BKP_STORE" "$T13_BKP"
+    printf 'unmounted_proj\t/mnt/unmounted_disk/my_app\t/mnt/unmounted_disk/my_app/docker-compose.yml\n' > "$T13_BKP/metadata/compose_manifest.tsv"
+    tar -czf "$T13_BKP/compose/unmounted_proj.tar.gz" -T /dev/null 2>/dev/null || touch "$T13_BKP/compose/unmounted_proj.tar.gz"
+    (
+        cd "$T13_BKP"
+        rm -f sha256sums.txt backup_manifest.txt
+        find . -type f | sort | while IFS= read -r f; do
+            clean_f="${f#./}"
+            sha256sum "$clean_f"
+        done > sha256sums.txt
+        echo "manifest" > backup_manifest.txt
+        sha256sum backup_manifest.txt >> sha256sums.txt
+    )
+
+    set +e
+    sh "$T13_BKP/docker_upgrade_helper.sh" restore \
+        --backup-dir "$T13_BKP" \
+        --target-data-root "$DST_DOCKER" \
+        --sys-root "$SYS_ROOT" 2>"$TEST_SANDBOX/t13_compose.log"
+    ret=$?
+    set -e
+    if [ "$ret" -eq 0 ]; then
+        echo "FAIL: Compose 恢复目标位于未挂载路径时竟然放行！"
+        exit 1
+    fi
+    if ! grep -qiE "(位于根文件系统或内部 /overlay|易失或升级重置设备)" "$TEST_SANDBOX/t13_compose.log"; then
+        echo "FAIL: Compose 挂载安全报错信息异常: $(cat "$TEST_SANDBOX/t13_compose.log")"
+        exit 1
+    fi
+
+    # 13c: Bind Mount 目标目录位于未挂载路径时拦截
+    rm -rf "$T13_BKP"
+    cp -r "$BKP_STORE" "$T13_BKP"
+    echo "/mnt/unmounted_disk/bind_data" >> "$T13_BKP/metadata/bind_mounts.txt"
+    (
+        cd "$T13_BKP"
+        rm -f sha256sums.txt backup_manifest.txt
+        find . -type f | sort | while IFS= read -r f; do
+            clean_f="${f#./}"
+            sha256sum "$clean_f"
+        done > sha256sums.txt
+        echo "manifest" > backup_manifest.txt
+        sha256sum backup_manifest.txt >> sha256sums.txt
+    )
+
+    set +e
+    sh "$T13_BKP/docker_upgrade_helper.sh" restore \
+        --backup-dir "$T13_BKP" \
+        --target-data-root "$DST_DOCKER" \
+        --sys-root "$SYS_ROOT" 2>"$TEST_SANDBOX/t13_bind.log"
+    ret=$?
+    set -e
+    if [ "$ret" -eq 0 ]; then
+        echo "FAIL: Bind Mount 恢复目标位于未挂载路径时竟然放行！"
+        exit 1
+    fi
+    if ! grep -qiE "(位于根文件系统或内部 /overlay|易失或升级重置设备)" "$TEST_SANDBOX/t13_bind.log"; then
+        echo "FAIL: Bind Mount 挂载安全报错信息异常: $(cat "$TEST_SANDBOX/t13_bind.log")"
+        exit 1
+    fi
+)
+echo "PASS: 测试 13 通过（恢复阶段 DataRoot、Compose、Bind 目标路径未挂载外部盘全部被严格拦截）"
+
+# -----------------------------------------------------------------------------
+# 测试 14: 独立容器多网络拓扑备份阻断
+# -----------------------------------------------------------------------------
+echo "--- 测试 14: 独立容器连接多个网络备份阻断 ---"
+(
+    MOCK_DOCKER_ROOT="$TEST_SANDBOX/t14_docker"
+    T14_TARGET="$TEST_SANDBOX/t14_target"
+    mkdir -p "$MOCK_DOCKER_ROOT/volumes" "$T14_TARGET"
+
+    echo "multi_net_cid" > "$MOCK_STATE/containers_list_ids"
+    echo "multi_net_app" > "$MOCK_STATE/cname_multi_net_cid"
+    echo "alpine:latest" > "$MOCK_STATE/cimg_multi_net_cid"
+    echo "2" > "$MOCK_STATE/net_count_multi_net_cid"
+
+    set +e
+    sh "$HELPER_SCRIPT" backup \
+        --docker-dir "$MOCK_DOCKER_ROOT" \
+        --target-dir "$T14_TARGET" \
+        --sys-root "$SYS_ROOT" \
+        --skip-stop 2>"$TEST_SANDBOX/t14.log"
+    ret=$?
+    set -e
+    rm -f "$MOCK_STATE/containers_list_ids" "$MOCK_STATE/net_count_multi_net_cid"
+
+    if [ "$ret" -eq 0 ]; then
+        echo "FAIL: 连接多个网络的独立容器备份竟然放行！"
+        exit 1
+    fi
+    if ! grep -q "连接了多个网络" "$TEST_SANDBOX/t14.log"; then
+        echo "FAIL: 多网络报错信息不符合预期: $(cat "$TEST_SANDBOX/t14.log")"
+        exit 1
+    fi
+)
+echo "PASS: 测试 14 通过（连接多个网络的独立容器在备份阶段被成功阻断并提示迁移编排）"
+
+echo "=== 全部 14 项深度隔离测试与回归演练已通过！ ==="

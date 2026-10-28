@@ -17,18 +17,22 @@ cat /etc/openwrt_release | grep DISTRIB_DESCRIPTION
 cat /tmp/sysinfo/model 2>/dev/null || cat /proc/device-tree/model 2>/dev/null
 ```
 
-### 2. 目标升级分区与容量核查（严禁 60MB 原厂分区刷入 PLUS）
-雅典娜采用 eMMC 双系统分区设计（`rootfs` 与 `rootfs_1`），`sysupgrade` 升级时会将固件写入**当前非活动的对侧分区**。
-```bash
-# 1. 识别当前活动启动分区（例如 root=rootfs 或 root=rootfs_1）
-cat /proc/cmdline | grep -o 'root=[^ ]*'
+### 2. 目标升级分区与容量核查（严格遵循 BOOTCONFIG 判定机制，严禁 60MB 原厂分区刷入 PLUS）
+雅典娜采用 eMMC 双系统分区设计（内核为 `0:HLOS`/`0:HLOS_1`，根文件系统为 `rootfs`/`rootfs_1`）。OpenWrt 平台的 `sysupgrade`（`platform.sh`）通过读取 `0:BOOTCONFIG` 分区第 148 字节标记确定目标写入分区：
+- 标记为 `1`：写入 `0:HLOS_1`（内核）与 `rootfs_1`（根文件系统）；
+- 标记为 `0`：写入 `0:HLOS`（内核）与 `rootfs`（根文件系统）；
+- 若 BOOTCONFIG 读取受阻，则回退读取 `/proc/cmdline` 的 `root=` 参数反推对侧分区。
 
-# 2. 查看 eMMC 分区表及对侧目标分区扇区容量
-fdisk -l /dev/mmcblk0 | grep -E "rootfs|rootfs_1"
+```bash
+# 1. 查看 BOOTCONFIG 分区偏移 148 字节标记（确定主备切换目标）
+hexdump -e '1/1 "%01x|"' -n 1 -s 148 -C /dev/disk/by-partlabel/0:BOOTCONFIG 2>/dev/null || od -An -tx1 -N 1 -j 148 /dev/mmcblk0p2
+
+# 2. 查看 eMMC 分区表及目标内核与根文件系统分区扇区容量
+fdisk -l /dev/mmcblk0 | grep -E "0:BOOTCONFIG|0:HLOS|rootfs"
 ```
 - **容量红线判定**：
   - 本次 PLUS 完整升级包约为 **152.04 MB**（解压刷入需占用对应分区大小）。
-  - 为保证系统启动后有足够的内部临时存储空间，待升级目标分区必须 **大于 200 MB**（如扩容后的 512MB 或 1024MB 分区）。
+  - 为保证系统启动后有足够的内部临时存储空间，待升级目标根文件系统分区必须 **大于 200 MB**（如扩容后的 512MB 或 1024MB 分区），目标内核分区需大于 4MB。
   - 若待升级的对侧分区仅为 **60 MB**（未扩容的原厂双分区状态），**严禁刷入 PLUS 版**（会导致分区溢出变砖！），请先选择 30MB 的 `PURE` 纯净版，或使用 U-Boot 重新刷入扩容分区表。
   - **重要原则**：绝不能根据整机 64GB/128GB eMMC 的总存储容量来判断能否刷入，必须精确核对待写入的目标分区实际大小；双分区机型绝不能盲目取两者中较大的一个。
 
@@ -233,12 +237,13 @@ df -h | grep /mnt/sda1 || mount /mnt/sda1
     --target-data-root /mnt/sda1/docker_data
 ```
 还原流程包括：
-- 严格校验 `sha256sums.txt`，确保归档未发生位翻转或损坏；
-- 确认目标 DataRoot 挂载安全，严禁解压到内部 `/overlay`；
+- 严格校验全局 `sha256sums.txt` 与组件清单，确保所有归档、脚本与配置无缺漏、未发生位翻转或损坏；
+- 预先核验所有恢复目标（DataRoot、Compose 目标目录、Bind Mounts 目标目录）的挂载安全性与存储设备，严禁任何未挂载外部盘的目标写入内部 `/overlay` 或 `/`；
 - 恢复 `/etc/config/dockerd` 与 `/etc/docker/daemon.json` 配置，自动同步更新 `data_root` 路径；
-- 解压释放 Named Volumes 与 Bind Mounts 至宿主机原路径；
+- 按照安全解压时序：先释放 Compose 编排目录结构，后解压释放 Bind Mounts 与 Named Volumes，确保冷备持久化数据绝对权威，绝不被 Compose 目录内的旧归档覆盖；
 - 启动 dockerd 守护进程并按原有状态恢复开机自启；
-- 仅拉起本次升级记录的 Compose 编排项目，重建独立容器；
+- 仅拉起本次升级记录的 Compose 编排项目（严格使用记录的项目名 `-p`、配置文件 `-f` 与 `--env-file`）；
+- 按完整配置参数（环境变量 `-e`、端口映射 `-p`、数据挂载 `-v`、网络模式 `--net`、重启策略 `--restart`、特权 `--privileged`、启动命令与参数）重建独立容器；
 - 若存在 SQL 备份文件，按需导入对应数据库。
 
 ---
@@ -287,14 +292,19 @@ done
 
 必须通过指定本地 SOCKS 端口进行带 TLS 握手的 HTTPS 深度请求与出口 IP 核验：
 ```bash
-# 1. 自动定位活动核心的实际本地 SOCKS 端口（禁止盲猜默认 1080）
+# 1. 自动定位活动核心的实际本地 SOCKS 监听端口（严格解析 inbounds，杜绝截取 outbounds 远程端口或盲猜 1080）
 SOCKS_PORT=""
 for cfg in /var/etc/passwall2/*.json; do
     [ -f "$cfg" ] || continue
-    PORT_MATCH=$(grep -o '"port": *[0-9]*' "$cfg" | head -n 1 | awk '{print $2}')
-    [ -n "$PORT_MATCH" ] && { SOCKS_PORT="$PORT_MATCH"; break; }
+    if command -v jq >/dev/null 2>&1; then
+        SOCKS_PORT=$(jq -r '.inbounds[]? | select((.protocol? == "socks") or (.type? == "socks") or ((.tag? // "") | test("socks"; "i"))) | (.listen_port // .port // empty)' "$cfg" 2>/dev/null | head -n 1)
+    fi
+    if [ -z "$SOCKS_PORT" ]; then
+        SOCKS_PORT=$(sed -n '/"inbounds"/,/"outbounds"/p' "$cfg" | grep -oE '"(listen_port|port)": *[0-9]+' | head -n 1 | awk '{print $2}')
+    fi
+    [ -n "$SOCKS_PORT" ] && break
 done
-echo "PassWall2 活动核心 SOCKS 端口: $SOCKS_PORT"
+echo "PassWall2 活动核心 SOCKS 本地监听端口: $SOCKS_PORT"
 
 # 2. 发起真实 TLS 握手深度请求
 curl --socks5-hostname "127.0.0.1:$SOCKS_PORT" -m 10 -s -I https://www.google.com
@@ -311,14 +321,17 @@ logread -e passwall2 | tail -n 25
 
 ---
 
-### 2. 软硬件加速与 PPE Flowtable 卸载核对
+### 2. 软硬件加速与 PPE Flowtable 硬件卸载核对
+
+> [!WARNING]
+> 单纯在 nftables 中存在 `flowtable` 仅代表开启了**软件流表卸载**；Qualcomm PPE 硬件加速必须确认 flowtable 规则中包含 `flags = { hw_offload }` 硬件标志，且内核驱动未出现 probe failed。
 
 ```bash
-# 1. 验证内核 Flowtable 流表卸载规则
-nft list tables | grep -q "flowtable" && echo "Flowtable 硬件流表: 已生效"
+# 1. 验证内核 Flowtable 流表是否包含硬件卸载标志 hw_offload
+nft list ruleset | grep -qE "flags[[:space:]]*=[[:space:]]*\{[[:space:]]*hw_offload[[:space:]]*\}|hw_offload" && echo "PPE 硬件卸载标志: 已生效" || echo "警告: 仅为软件 Flowtable，缺少 hw_offload 硬件标志"
 
-# 2. 检查内核日志是否存在 PPE 驱动初始化报错
-dmesg | grep -qiE "(ppe|flowtable).*(fail|error|disabled)" && echo "警告: PPE 驱动存在报错" || echo "PPE 驱动就绪: 无报错"
+# 2. 检查内核日志是否存在 PPE 驱动初始化或探测失败
+dmesg | grep -qiE "(ppe|flowtable|qcom-ppe).*(fail|error|disabled)" && echo "警告: PPE 驱动探测或初始化存在报错！" || echo "PPE 驱动就绪: 无报错"
 ```
 
 ---

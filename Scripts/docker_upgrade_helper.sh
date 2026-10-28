@@ -29,13 +29,20 @@ require_cmd() {
 get_sys_path() {
     p="$1"
     if [ -n "$SYS_ROOT" ]; then
-        echo "${SYS_ROOT%/}$p"
+        case "$p" in
+            "$SYS_ROOT"*)
+                echo "$p"
+                ;;
+            *)
+                echo "${SYS_ROOT%/}/${p#/}" | sed 's|//|/|g'
+                ;;
+        esac
     else
         echo "$p"
     fi
 }
 
-# 解析带 SYS_ROOT 隔离前缀的真实宿主路径
+# 解析带 SYS_ROOT 隔离前缀的真实宿主路径（隔离模式下严禁回退宿主机真实根路径）
 resolve_bind_path() {
     raw_p="$1"
     if [ -n "$SYS_ROOT" ]; then
@@ -44,11 +51,7 @@ resolve_bind_path() {
                 echo "$raw_p"
                 ;;
             *)
-                if [ -e "${SYS_ROOT%/}$raw_p" ]; then
-                    echo "${SYS_ROOT%/}$raw_p"
-                else
-                    echo "$raw_p"
-                fi
+                echo "${SYS_ROOT%/}/${raw_p#/}" | sed 's|//|/|g'
                 ;;
         esac
     else
@@ -56,17 +59,24 @@ resolve_bind_path() {
     fi
 }
 
-# 挂载安全性与存储介质类型核查
+# 挂载安全性与存储介质类型核查（支持对尚未创建的目标路径向上查找其已挂载的祖先目录）
 check_mount_safety() {
     target_path="$1"
     label="$2"
 
-    if [ ! -d "$target_path" ]; then
-        log_error "$label 目录不存在: $target_path"
+    check_dir="$target_path"
+    while [ ! -d "$check_dir" ] && [ "$check_dir" != "/" ] && [ "$check_dir" != "." ]; do
+        parent_dir=$(dirname "$check_dir")
+        [ "$parent_dir" = "$check_dir" ] && break
+        check_dir="$parent_dir"
+    done
+
+    if [ ! -d "$check_dir" ]; then
+        log_error "$label 目录或其祖先目录不存在: $target_path"
         exit 1
     fi
 
-    target_abs=$(cd "$target_path" && pwd -P)
+    target_abs=$(cd "$check_dir" && pwd -P)
 
     df_out=$(df -P "$target_abs" 2>/dev/null || true)
     if [ -z "$df_out" ]; then
@@ -78,11 +88,11 @@ check_mount_safety() {
     avail_kb=$(echo "$df_out" | awk 'NR==2{print $4}')
     mnt_point=$(echo "$df_out" | awk 'NR==2{print $6}')
 
-    log_info "$label 挂载信息: 挂载点=$mnt_point, 设备=$mnt_dev, 可用=${avail_kb}KB"
+    log_info "$label 挂载信息: 路径=$target_path (实际挂载根=$mnt_point), 设备=$mnt_dev, 可用=${avail_kb}KB"
 
     # 严禁目标位于根分区、/overlay 或只读 rom
     if [ "$mnt_point" = "/" ] || [ "$mnt_point" = "/overlay" ] || [ "$mnt_point" = "/rom" ]; then
-        log_error "$label 位于根文件系统或 /overlay ($mnt_point, 设备: $mnt_dev)！系统升级后将被重置，严禁在此操作！必须挂载外部独立存储介质。"
+        log_error "$label 位于根文件系统或内部 /overlay ($mnt_point, 设备: $mnt_dev)！外部业务存储未挂载，严禁在此操作！必须挂载外部独立存储介质。"
         exit 1
     fi
 
@@ -168,7 +178,7 @@ do_precheck() {
     fi
     log_info "当前固件: ${FW_DESC:-OpenWrt} | 设备型号: ${HW_MODEL:-JDCloud AX6600 (RE-CS-02)}"
 
-    # 2. 检查 eMMC 分区与对侧待升级目标分区
+    # 2. 检查 eMMC 分区与对侧待升级目标分区 (严格遵循 OpenWrt qualcommax platform.sh 的 BOOTCONFIG 判定机制)
     MMC_DEV="/dev/mmcblk0"
     PROC_CMDLINE="$(get_sys_path /proc/cmdline)"
 
@@ -179,11 +189,67 @@ do_precheck() {
         exit 1
     fi
 
-    ACTIVE_ROOT=""
-    if [ -f "$PROC_CMDLINE" ]; then
-        ACTIVE_ROOT=$(grep -o 'root=[^ ]*' "$PROC_CMDLINE" | head -n 1 | cut -d= -f2 || true)
+    # 尝试定位 0:BOOTCONFIG 分区设备节点 (如 /dev/disk/by-partlabel/0:BOOTCONFIG 或 /dev/mmcblk0p2)
+    CFGPART="$(get_sys_path /dev/disk/by-partlabel/0:BOOTCONFIG)"
+    if [ ! -e "$CFGPART" ]; then
+        BOOTCONF_DEV=$(echo "$FDISK_OUT" | grep -E "[[:space:]]0:BOOTCONFIG[[:space:]]*$" | awk '{print $1}' | head -n 1 || true)
+        if [ -n "$BOOTCONF_DEV" ]; then
+            CFGPART="$(get_sys_path "$BOOTCONF_DEV")"
+        fi
+    fi
+    if [ ! -e "$CFGPART" ] && [ -e "$(get_sys_path /dev/mmcblk0p2)" ]; then
+        CFGPART="$(get_sys_path /dev/mmcblk0p2)"
     fi
 
+    PART_NUM=""
+    TARGET_SRC=""
+    if [ -e "$CFGPART" ]; then
+        if command -v hexdump >/dev/null 2>&1; then
+            PART_NUM=$(hexdump -e '1/1 "%01x|"' -n 1 -s 148 -C "$CFGPART" 2>/dev/null | cut -f 1 -d "|" | head -n1 || true)
+        fi
+        if [ -z "$PART_NUM" ] && command -v od >/dev/null 2>&1; then
+            OD_HEX=$(od -An -tx1 -N 1 -j 148 "$CFGPART" 2>/dev/null | awk '{print $1}' || true)
+            [ "$OD_HEX" = "01" ] && PART_NUM="1"
+            [ "$OD_HEX" = "00" ] && PART_NUM="0"
+        fi
+        if [ -n "$PART_NUM" ]; then
+            TARGET_SRC="0:BOOTCONFIG 分区偏移 148 字节标记 ($PART_NUM)"
+        fi
+    fi
+
+    TARGET_KERN=""
+    TARGET_ROOTFS=""
+    if [ "$PART_NUM" = "1" ]; then
+        TARGET_KERN="0:HLOS_1"
+        TARGET_ROOTFS="rootfs_1"
+    elif [ "$PART_NUM" = "0" ]; then
+        TARGET_KERN="0:HLOS"
+        TARGET_ROOTFS="rootfs"
+    else
+        # 若 BOOTCONFIG 读取失败或不存在，回退至 /proc/cmdline 的 root 参数反推对侧
+        ACTIVE_ROOT=""
+        if [ -f "$PROC_CMDLINE" ]; then
+            ACTIVE_ROOT=$(grep -o 'root=[^ ]*' "$PROC_CMDLINE" | head -n 1 | cut -d= -f2 || true)
+        fi
+        if [ -n "$ACTIVE_ROOT" ]; then
+            case "$ACTIVE_ROOT" in
+                *rootfs_1*)
+                    TARGET_KERN="0:HLOS"
+                    TARGET_ROOTFS="rootfs"
+                    TARGET_SRC="cmdline 对侧回退推导 (当前启动: rootfs_1)"
+                    ;;
+                *rootfs*)
+                    TARGET_KERN="0:HLOS_1"
+                    TARGET_ROOTFS="rootfs_1"
+                    TARGET_SRC="cmdline 对侧回退推导 (当前启动: rootfs)"
+                    ;;
+            esac
+        fi
+    fi
+
+    # 提取分区扇区容量
+    HLOS_SEC=$(echo "$FDISK_OUT" | grep -E "[[:space:]]0:HLOS[[:space:]]*$" | awk '{print $4}' || true)
+    HLOS1_SEC=$(echo "$FDISK_OUT" | grep -E "[[:space:]]0:HLOS_1[[:space:]]*$" | awk '{print $4}' || true)
     ROOTFS_SEC=$(echo "$FDISK_OUT" | grep -E "[[:space:]]rootfs[[:space:]]*$" | awk '{print $4}' || true)
     ROOTFS1_SEC=$(echo "$FDISK_OUT" | grep -E "[[:space:]]rootfs_1[[:space:]]*$" | awk '{print $4}' || true)
 
@@ -197,43 +263,49 @@ do_precheck() {
         exit 1
     fi
 
-    TARGET_SEC=""
-    TARGET_PART=""
-    if [ -n "$ACTIVE_ROOT" ]; then
-        case "$ACTIVE_ROOT" in
-            *rootfs_1*)
-                TARGET_PART="rootfs (对侧待升级目标)"
-                TARGET_SEC="$ROOTFS_SEC"
-                ;;
-            *rootfs*)
-                TARGET_PART="rootfs_1 (对侧待升级目标)"
-                TARGET_SEC="$ROOTFS1_SEC"
-                ;;
-        esac
-    fi
-
-    # 若无法确定当前启动分区，取候选分区中较小者（严禁取大），确保安全边际
-    if [ -z "$TARGET_SEC" ]; then
+    # 若仍无法判定目标分区，取候选根文件系统较小者（严禁取大），确保安全边际
+    if [ -z "$TARGET_ROOTFS" ]; then
         if [ -n "$ROOTFS_SEC" ] && [ -n "$ROOTFS1_SEC" ]; then
             if [ "$ROOTFS_SEC" -le "$ROOTFS1_SEC" ]; then
-                TARGET_SEC="$ROOTFS_SEC"
-                TARGET_PART="rootfs (较小分区)"
+                TARGET_KERN="0:HLOS"
+                TARGET_ROOTFS="rootfs"
+                TARGET_SRC="候选较小分区安全保底"
             else
-                TARGET_SEC="$ROOTFS1_SEC"
-                TARGET_PART="rootfs_1 (较小分区)"
+                TARGET_KERN="0:HLOS_1"
+                TARGET_ROOTFS="rootfs_1"
+                TARGET_SRC="候选较小分区安全保底"
             fi
         elif [ -n "$ROOTFS_SEC" ]; then
-            TARGET_SEC="$ROOTFS_SEC"
-            TARGET_PART="rootfs"
+            TARGET_KERN="0:HLOS"
+            TARGET_ROOTFS="rootfs"
+            TARGET_SRC="单分区 rootfs"
         else
-            TARGET_SEC="$ROOTFS1_SEC"
-            TARGET_PART="rootfs_1"
+            TARGET_KERN="0:HLOS_1"
+            TARGET_ROOTFS="rootfs_1"
+            TARGET_SRC="单分区 rootfs_1"
         fi
     fi
 
-    TARGET_BYTES=$((TARGET_SEC * 512))
-    TARGET_MB=$((TARGET_BYTES / 1024 / 1024))
-    log_info "当前启动分区: ${ACTIVE_ROOT:-未知} | 待升级目标分区: [$TARGET_PART] 扇区数: $TARGET_SEC (容量: ${TARGET_MB}MB)"
+    TARGET_KERN_SEC=0
+    if [ "$TARGET_KERN" = "0:HLOS_1" ] && [ -n "$HLOS1_SEC" ]; then
+        TARGET_KERN_SEC="$HLOS1_SEC"
+    elif [ -n "$HLOS_SEC" ]; then
+        TARGET_KERN_SEC="$HLOS_SEC"
+    fi
+    TARGET_KERN_MB=$((TARGET_KERN_SEC * 512 / 1024 / 1024))
+
+    TARGET_ROOTFS_SEC=0
+    if [ "$TARGET_ROOTFS" = "rootfs_1" ] && [ -n "$ROOTFS1_SEC" ]; then
+        TARGET_ROOTFS_SEC="$ROOTFS1_SEC"
+    elif [ -n "$ROOTFS_SEC" ]; then
+        TARGET_ROOTFS_SEC="$ROOTFS_SEC"
+    fi
+    TARGET_ROOTFS_BYTES=$((TARGET_ROOTFS_SEC * 512))
+    TARGET_ROOTFS_MB=$((TARGET_ROOTFS_BYTES / 1024 / 1024))
+
+    log_info "待升级目标分区判定依据: $TARGET_SRC"
+    log_info "  - 目标内核分区: [$TARGET_KERN] 扇区数: $TARGET_KERN_SEC (容量: ${TARGET_KERN_MB}MB)"
+    log_info "  - 目标根文件系统: [$TARGET_ROOTFS] 扇区数: $TARGET_ROOTFS_SEC (容量: ${TARGET_ROOTFS_MB}MB)"
 
     # 3. Docker 运行状态、存储驱动、DockerRootDir 与存储介质分类
     if command -v docker >/dev/null 2>&1; then
@@ -302,13 +374,30 @@ do_precheck() {
         fi
         log_info "固件平台兼容性校验通过"
 
-        MIN_REQUIRED_BYTES=$((IMG_SIZE + 52428800))
-        MIN_REQUIRED_MB=$((MIN_REQUIRED_BYTES / 1024 / 1024))
-        if [ "$TARGET_BYTES" -le "$MIN_REQUIRED_BYTES" ]; then
-            log_error "目标分区容量 (${TARGET_MB}MB) 不足！刷入 ${IMG_SIZE_MB}MB 固件需至少 ${MIN_REQUIRED_MB}MB 空间以保留充足 overlay！"
+        # 目标根文件系统容量安全阈值核验 (严禁在未扩容的原厂 60MB 双分区刷入 PLUS 版)
+        if [ "$TARGET_ROOTFS_MB" -lt 200 ]; then
+            log_error "待升级目标根文件系统分区 [$TARGET_ROOTFS] 容量仅为 ${TARGET_ROOTFS_MB}MB，小于 200MB 安全阈值！严禁在未扩容的分区刷入 PLUS 完整版固件！请选择 PURE 纯净版或通过 U-Boot 重新分区扩容。"
             exit 1
         fi
-        log_info "目标分区容量安全校验通过 (${TARGET_MB}MB > ${MIN_REQUIRED_MB}MB)"
+
+        if [ "$IMG_SIZE_MB" -gt "$TARGET_ROOTFS_MB" ]; then
+            log_error "固件大小 (${IMG_SIZE_MB}MB) 超过目标根文件系统分区容量 (${TARGET_ROOTFS_MB}MB)！禁止刷入！"
+            exit 1
+        fi
+
+        MIN_REQUIRED_BYTES=$((IMG_SIZE + 52428800))
+        MIN_REQUIRED_MB=$((MIN_REQUIRED_BYTES / 1024 / 1024))
+        if [ "$TARGET_ROOTFS_BYTES" -le "$MIN_REQUIRED_BYTES" ]; then
+            log_error "目标分区容量 (${TARGET_ROOTFS_MB}MB) 不足！刷入 ${IMG_SIZE_MB}MB 固件需至少 ${MIN_REQUIRED_MB}MB 空间以保留充足 overlay！"
+            exit 1
+        fi
+
+        if [ "$TARGET_KERN_SEC" -gt 0 ] && [ "$TARGET_KERN_MB" -lt 4 ]; then
+            log_error "待升级目标内核分区 [$TARGET_KERN] 容量异常 (${TARGET_KERN_MB}MB)！"
+            exit 1
+        fi
+
+        log_info "目标分区容量安全校验通过: 根文件系统 (${TARGET_ROOTFS_MB}MB > ${MIN_REQUIRED_MB}MB), 内核 (${TARGET_KERN_MB}MB)"
     fi
 }
 
@@ -522,11 +611,6 @@ do_backup() {
                                 router_workdir="/${router_workdir#/}"
                             fi
                             echo "$is_compose	$router_workdir	${comp_config:-$router_workdir/docker-compose.yml}" >> "$COMPOSE_MANIFEST"
-                            # 打包整个项目目录（包含 .env 等隐藏文件）
-                            tar -czf "$COMPOSE_STORE/${is_compose}.tar.gz" -C "$actual_workdir" . || {
-                                log_error "归档 Compose 项目 $is_compose 失败！"
-                                exit 1
-                            }
                             c_kb=$(du -sk "$actual_workdir" 2>/dev/null | awk '{print $1}' || echo 0)
                             TOTAL_NEED_KB=$((TOTAL_NEED_KB + c_kb))
                         fi
@@ -541,6 +625,13 @@ do_backup() {
                         exit 1
                     fi
                     echo "$cname" >> "$STANDALONE_MANIFEST"
+
+                    # 检查高级网络配置：若容器连接了多个网络，单一 docker run 无法精准还原，备份阶段必须明确阻断
+                    net_count=$(docker inspect -f '{{len .NetworkSettings.Networks}}' "$cid" 2>/dev/null || echo 1)
+                    if [ "$net_count" -gt 1 ]; then
+                        log_error "独立容器 $cname 连接了多个网络 ($net_count 个)，单一 docker run 无法还原多网络拓扑！为防止配置丢失，已在备份阶段阻断。请将其迁移为 Docker Compose 编排管理。"
+                        exit 1
+                    fi
 
                     # 检查可写层改动
                     has_diff=0
@@ -564,11 +655,28 @@ do_backup() {
                         TOTAL_NEED_KB=$((TOTAL_NEED_KB + i_kb))
                     fi
 
-                    # 生成独立容器重建脚本
+                    # 生成独立容器重建脚本（完整还原支持的设置：-e, -p, -v, --net, --restart, --privileged, -u, -w, -h, --entrypoint, Cmd）
                     rec_script="$STANDALONE_STORE/recreate_${cname}.sh"
                     cnet=$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$cid" 2>/dev/null || true)
                     crestart=$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$cid" 2>/dev/null || true)
                     cpriv=$(docker inspect -f '{{.HostConfig.Privileged}}' "$cid" 2>/dev/null || true)
+                    cuser=$(docker inspect -f '{{.Config.User}}' "$cid" 2>/dev/null || true)
+                    cworkdir=$(docker inspect -f '{{.Config.WorkingDir}}' "$cid" 2>/dev/null || true)
+                    chostname=$(docker inspect -f '{{.Config.Hostname}}' "$cid" 2>/dev/null || true)
+                    centrypoint=$(docker inspect -f '{{range .Config.Entrypoint}}{{.}} {{end}}' "$cid" 2>/dev/null || true)
+                    centrypoint=$(echo "$centrypoint" | awk '{print $1}')
+
+                    cports=$(docker inspect -f '{{range $p, $conf := .HostConfig.PortBindings}}{{range $conf}}{{if .HostIp}}{{.HostIp}}:{{end}}{{.HostPort}}:{{$p}}
+{{end}}{{end}}' "$cid" 2>/dev/null || true)
+
+                    cenvs=$(docker inspect -f '{{range .Config.Env}}{{.}}
+{{end}}' "$cid" 2>/dev/null || true)
+
+                    cbinds=$(docker inspect -f '{{range .HostConfig.Binds}}{{.}}
+{{end}}' "$cid" 2>/dev/null || true)
+
+                    ccmd=$(docker inspect -f '{{range .Config.Cmd}}{{.}}
+{{end}}' "$cid" 2>/dev/null || true)
 
                     cat << EOF_REC > "$rec_script"
 #!/bin/sh
@@ -579,34 +687,59 @@ EOF_REC
                     if [ "$has_diff" -eq 1 ]; then
                         echo "docker load -i \"\$STANDALONE_DIR/image_${cname}.tar\"" >> "$rec_script"
                     fi
-                    run_line="docker run -d --name \"$cname\""
-                    [ -n "$cnet" ] && [ "$cnet" != "default" ] && run_line="$run_line --net \"$cnet\""
-                    [ -n "$crestart" ] && [ "$crestart" != "no" ] && run_line="$run_line --restart \"$crestart\""
-                    [ "$cpriv" = "true" ] && run_line="$run_line --privileged"
 
-                    binds=$(docker inspect -f '{{range .HostConfig.Binds}}{{.}} {{end}}' "$cid" 2>/dev/null || true)
-                    for b in $binds; do
-                        [ -n "$b" ] && run_line="$run_line -v \"$b\""
-                    done
+                    printf 'docker run -d --name "%s"' "$cname" >> "$rec_script"
+                    [ -n "$cnet" ] && [ "$cnet" != "default" ] && printf ' --net "%s"' "$cnet" >> "$rec_script"
+                    [ -n "$crestart" ] && [ "$crestart" != "no" ] && printf ' --restart "%s"' "$crestart" >> "$rec_script"
+                    [ "$cpriv" = "true" ] && printf ' --privileged' >> "$rec_script"
+                    [ -n "$cuser" ] && printf ' -u "%s"' "$cuser" >> "$rec_script"
+                    [ -n "$cworkdir" ] && printf ' -w "%s"' "$cworkdir" >> "$rec_script"
+                    [ -n "$chostname" ] && printf ' -h "%s"' "$chostname" >> "$rec_script"
+                    [ -n "$centrypoint" ] && printf ' --entrypoint "%s"' "$centrypoint" >> "$rec_script"
 
-                    run_line="$run_line \"$img_for_run\""
-                    echo "$run_line" >> "$rec_script"
+                    if [ -n "$cports" ]; then
+                        echo "$cports" | while IFS= read -r p_item || [ -n "$p_item" ]; do
+                            [ -z "$p_item" ] && continue
+                            printf ' -p "%s"' "$p_item" >> "$rec_script"
+                        done
+                    fi
+
+                    if [ -n "$cenvs" ]; then
+                        echo "$cenvs" | while IFS= read -r e_item || [ -n "$e_item" ]; do
+                            [ -z "$e_item" ] && continue
+                            printf ' -e "%s"' "$e_item" >> "$rec_script"
+                        done
+                    fi
+
+                    if [ -n "$cbinds" ]; then
+                        echo "$cbinds" | while IFS= read -r b_item || [ -n "$b_item" ]; do
+                            [ -z "$b_item" ] && continue
+                            printf ' -v "%s"' "$b_item" >> "$rec_script"
+                        done
+                    fi
+
+                    printf ' "%s"' "$img_for_run" >> "$rec_script"
+
+                    if [ -n "$ccmd" ]; then
+                        echo "$ccmd" | while IFS= read -r a_item || [ -n "$a_item" ]; do
+                            [ -z "$a_item" ] && continue
+                            printf ' "%s"' "$a_item" >> "$rec_script"
+                        done
+                    fi
+
+                    printf '\n' >> "$rec_script"
                     chmod +x "$rec_script"
                 fi
             done
         fi
 
-        # 处理显式指定的 Compose 目录
+        # 处理显式指定的 Compose 目录（仅登记元数据，冷备归档延后至停机后）
         if [ -n "$COMPOSE_DIR" ] && [ -d "$COMPOSE_DIR" ]; then
             comp_abs=$(cd "$COMPOSE_DIR" && pwd -P)
             pname=$(basename "$comp_abs")
             if ! grep -q "^$pname	" "$COMPOSE_MANIFEST" 2>/dev/null; then
-                log_info "归档显式指定的 Compose 目录: $comp_abs"
+                log_info "登记显式指定的 Compose 目录: $comp_abs"
                 echo "$pname	$comp_abs	$comp_abs/docker-compose.yml" >> "$COMPOSE_MANIFEST"
-                tar -czf "$COMPOSE_STORE/${pname}.tar.gz" -C "$comp_abs" . || {
-                    log_error "归档 Compose 目录 $comp_abs 失败！"
-                    exit 1
-                }
                 c_kb=$(du -sk "$comp_abs" 2>/dev/null | awk '{print $1}' || echo 0)
                 TOTAL_NEED_KB=$((TOTAL_NEED_KB + c_kb))
             fi
@@ -759,7 +892,30 @@ EOF_REC
         }
     fi
 
-    # 8. 归档 Bind Mounts 并校验完整性
+    # 8. 停机后归档 Compose 项目目录（冷备一致性保证，在停机后归档，确保与 Bind Mounts 状态同步）
+    if [ -f "$COMPOSE_MANIFEST" ]; then
+        log_info "正在冷备归档 Compose 项目目录..."
+        while IFS='	' read -r cproj cdir ccfg || [ -n "$cproj" ]; do
+            [ -z "$cproj" ] && continue
+            actual_cdir=$(resolve_bind_path "$cdir")
+            if [ -d "$actual_cdir" ]; then
+                proj_archive="$COMPOSE_STORE/${cproj}.tar.gz"
+                tar -czf "$proj_archive" -C "$actual_cdir" . || {
+                    log_error "归档 Compose 项目 $cproj 失败！"
+                    exit 1
+                }
+                tar -tzf "$proj_archive" >/dev/null 2>&1 || {
+                    log_error "Compose 归档 $proj_archive 校验损坏！"
+                    exit 1
+                }
+            else
+                log_error "Compose 项目 $cproj 目录不存在: $actual_cdir"
+                exit 1
+            fi
+        done < "$COMPOSE_MANIFEST"
+    fi
+
+    # 9. 归档 Bind Mounts 并校验完整性
     BIND_ARCHIVE="$TARGET_ABS/docker_bind_mounts.tar.gz"
     if [ -s "$BIND_MOUNTS_FILE" ]; then
         log_info "正在归档外部 Bind Mounts 数据..."
@@ -805,27 +961,36 @@ EOF_REC
         done < "$BIND_MOUNTS_FILE"
     fi
 
-    # 9. 生成 SHA256 校验和清单
-    log_info "生成 SHA256 校验和..."
+    # 10. 生成全局备份校验清单与 SHA256 校验和（覆盖所有归档、脚本、配置与数据库）
+    log_info "生成全局备份校验清单与 SHA256 校验和..."
     require_cmd sha256sum
     (
         cd "$TARGET_ABS"
-        sha256sum docker_volumes.tar.gz > sha256sums.txt
-        if [ -f "docker_bind_mounts.tar.gz" ]; then
-            sha256sum docker_bind_mounts.tar.gz >> sha256sums.txt
-        fi
-        if [ -f "metadata/containers_inspect.json" ]; then
-            sha256sum metadata/containers_inspect.json >> sha256sums.txt
-        fi
-        if [ -d "databases" ]; then
-            for dbf in databases/*.sql; do
-                [ -f "$dbf" ] || continue
-                sha256sum "$dbf" >> sha256sums.txt
-            done
-        fi
+        rm -f sha256sums.txt backup_manifest.txt
+        # 遍历目标目录下所有常规文件（不遗漏任何 compose、standalone、脚本或配置文件）
+        find . -type f | sort | while IFS= read -r f; do
+            clean_f="${f#./}"
+            sha256sum "$clean_f"
+        done > sha256sums.txt
+
+        {
+            echo "AX6600 Docker 备份摘要清单"
+            echo "生成时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || date)"
+            echo "DockerRootDir: $DOCKER_ROOT_DIR"
+            echo "开机自启记录: $(cat docker_autostart.state 2>/dev/null || echo '0')"
+            echo "Named Volumes 归档: docker_volumes.tar.gz"
+            [ -f "docker_bind_mounts.tar.gz" ] && echo "Bind Mounts 归档: docker_bind_mounts.tar.gz"
+            echo "Compose 项目数: $(wc -l < metadata/compose_manifest.tsv 2>/dev/null || echo 0)"
+            echo "独立容器数: $(wc -l < metadata/standalone_manifest.txt 2>/dev/null || echo 0)"
+            echo "备份文件总数: $(wc -l < sha256sums.txt)"
+            echo ""
+            echo "[FILES]"
+            sed 's/^[0-9a-fA-F]* [ *]*//' sha256sums.txt
+        } > backup_manifest.txt
+        sha256sum backup_manifest.txt >> sha256sums.txt
     )
 
-    log_info "Docker 完整备份完成，校验清单位于: $TARGET_ABS/sha256sums.txt"
+    log_info "Docker 完整备份完成，校验清单与全部文件哈希位于: $TARGET_ABS/sha256sums.txt"
 }
 
 # -----------------------------------------------------------------------------
@@ -866,27 +1031,87 @@ do_restore() {
         exit 1
     fi
 
-    # 1. 严格校验备份归档完整性
+    # 1. 严格校验全部备份构件完整性与哈希清单
     require_cmd sha256sum
     require_cmd tar
-    if [ ! -f "$BACKUP_DIR/sha256sums.txt" ] || [ ! -f "$BACKUP_DIR/docker_volumes.tar.gz" ]; then
-        log_error "备份文件不完整（缺少 sha256sums.txt 或 docker_volumes.tar.gz）！"
+    if [ ! -f "$BACKUP_DIR/sha256sums.txt" ] || [ ! -f "$BACKUP_DIR/docker_volumes.tar.gz" ] || [ ! -f "$BACKUP_DIR/backup_manifest.txt" ]; then
+        log_error "备份文件不完整（缺少 sha256sums.txt、backup_manifest.txt 或 docker_volumes.tar.gz）！"
         exit 1
     fi
 
-    log_info "正在核对备份文件 SHA256 校验和..."
+    log_info "正在核对全部备份文件 SHA256 校验和..."
     (
         cd "$BACKUP_DIR"
         sha256sum -c sha256sums.txt
     ) || {
-        log_error "备份文件校验失败，数据可能已损坏！"
+        log_error "备份文件完整性校验失败，数据存在缺失、篡改或损坏！严禁继续恢复！"
         exit 1
     }
 
-    # 2. 确认恢复端数据盘真实挂载，严禁解压到内部 /overlay
+    # 交叉核查所有清单组件实体是否存在且未损坏
+    COMPOSE_MANIFEST="$BACKUP_DIR/metadata/compose_manifest.tsv"
+    if [ -f "$COMPOSE_MANIFEST" ]; then
+        while IFS='	' read -r proj_name orig_dir config_file || [ -n "$proj_name" ]; do
+            [ -z "$proj_name" ] && continue
+            proj_tar="$BACKUP_DIR/compose/${proj_name}.tar.gz"
+            if [ ! -f "$proj_tar" ]; then
+                log_error "关键备份文件缺失: Compose 归档 $proj_tar 不存在！禁止恢复！"
+                exit 1
+            fi
+            if ! tar -tzf "$proj_tar" >/dev/null 2>&1; then
+                log_error "Compose 归档 $proj_tar 文件损坏！禁止恢复！"
+                exit 1
+            fi
+        done < "$COMPOSE_MANIFEST"
+    fi
+
+    STANDALONE_MANIFEST="$BACKUP_DIR/metadata/standalone_manifest.txt"
+    if [ -f "$STANDALONE_MANIFEST" ]; then
+        while IFS= read -r cname || [ -n "$cname" ]; do
+            [ -z "$cname" ] && continue
+            rec_sh="$BACKUP_DIR/standalone/recreate_${cname}.sh"
+            if [ ! -f "$rec_sh" ]; then
+                log_error "关键备份文件缺失: 独立容器重建脚本 $rec_sh 不存在！禁止恢复！"
+                exit 1
+            fi
+        done < "$STANDALONE_MANIFEST"
+    fi
+
+    BIND_MANIFEST="$BACKUP_DIR/metadata/bind_mounts.txt"
+    if [ -s "$BIND_MANIFEST" ]; then
+        if [ ! -f "$BACKUP_DIR/docker_bind_mounts.tar.gz" ]; then
+            log_error "关键备份文件缺失: 存在 Bind Mounts 记录但缺少归档 docker_bind_mounts.tar.gz！禁止恢复！"
+            exit 1
+        fi
+        if ! tar -tzf "$BACKUP_DIR/docker_bind_mounts.tar.gz" >/dev/null 2>&1; then
+            log_error "Bind Mounts 归档 docker_bind_mounts.tar.gz 损坏！禁止恢复！"
+            exit 1
+        fi
+    fi
+
+    # 2. 确认恢复端所有目标路径真实挂载在外部存储，严禁解压到内部 /overlay 或 /
+    log_info "正在预检全部恢复目标的挂载设备与安全性..."
     mkdir -p "$TARGET_DATA_ROOT"
     check_mount_safety "$TARGET_DATA_ROOT" "目标 DataRoot 目录"
     TARGET_DATA_ABS=$(cd "$TARGET_DATA_ROOT" && pwd -P)
+
+    # 预检所有 Compose 项目的目标路径挂载安全性
+    if [ -f "$COMPOSE_MANIFEST" ]; then
+        while IFS='	' read -r proj_name orig_dir config_file || [ -n "$proj_name" ]; do
+            [ -z "$proj_name" ] && continue
+            dest_dir=$(resolve_bind_path "$orig_dir")
+            check_mount_safety "$dest_dir" "Compose 项目 [$proj_name] 目标目录 ($orig_dir)"
+        done < "$COMPOSE_MANIFEST"
+    fi
+
+    # 预检所有 Bind Mounts 目标路径挂载安全性
+    if [ -f "$BIND_MANIFEST" ]; then
+        while IFS= read -r mpath || [ -n "$mpath" ]; do
+            [ -z "$mpath" ] && continue
+            actual_dest=$(resolve_bind_path "$mpath")
+            check_mount_safety "$actual_dest" "Bind Mount 恢复目标 ($mpath)"
+        done < "$BIND_MANIFEST"
+    fi
 
     # 3. 恢复前确认 dockerd 已停止
     INIT_DOCKERD="$(get_sys_path /etc/init.d/dockerd)"
@@ -936,14 +1161,23 @@ do_restore() {
         fi
     fi
 
-    # 5. 恢复 Named Volumes
-    log_info "正在恢复 Named Volumes 至: $TARGET_DATA_ABS..."
-    tar -xzf "$BACKUP_DIR/docker_volumes.tar.gz" -C "$TARGET_DATA_ABS" || {
-        log_error "解压 Named Volumes 失败！"
-        exit 1
-    }
+    # 5. 严格解压顺序：先解压 Compose 目录结构，后解压 Bind Mounts，确保冷备持久化数据绝不被旧 Compose 包覆盖
+    if [ -f "$COMPOSE_MANIFEST" ]; then
+        log_info "正在恢复 Compose 编排项目至原路径..."
+        while IFS='	' read -r proj_name orig_dir config_file || [ -n "$proj_name" ]; do
+            [ -z "$proj_name" ] && continue
+            proj_tar="$BACKUP_DIR/compose/${proj_name}.tar.gz"
+            dest_dir=$(resolve_bind_path "$orig_dir")
+            mkdir -p "$dest_dir"
+            tar -xzf "$proj_tar" -C "$dest_dir" || {
+                log_error "恢复 Compose 项目 $proj_name 失败！"
+                exit 1
+            }
+            log_info "已恢复 Compose 项目 [$proj_name] 到原路径: $dest_dir"
+        done < "$COMPOSE_MANIFEST"
+    fi
 
-    # 6. 恢复 Bind Mounts 数据至宿主机原路径
+    # 6. 恢复 Bind Mounts 数据至宿主机原路径（在 Compose 之后解压，权威覆盖持久化数据）
     if [ -f "$BACKUP_DIR/docker_bind_mounts.tar.gz" ]; then
         log_info "正在恢复 Bind Mounts 数据至原路径..."
         DEST_ROOT="/"
@@ -954,25 +1188,12 @@ do_restore() {
         }
     fi
 
-    # 7. 恢复 Compose 编排项目至原路径（严禁全部改放 /opt）
-    COMPOSE_MANIFEST="$BACKUP_DIR/metadata/compose_manifest.tsv"
-    if [ -f "$COMPOSE_MANIFEST" ]; then
-        log_info "正在恢复 Compose 编排文件至原路径..."
-        while IFS='	' read -r proj_name orig_dir config_file || [ -n "$proj_name" ]; do
-            [ -z "$proj_name" ] && continue
-            proj_tar="$BACKUP_DIR/compose/${proj_name}.tar.gz"
-            if [ -f "$proj_tar" ]; then
-                dest_dir="$orig_dir"
-                [ -n "$SYS_ROOT" ] && dest_dir="${SYS_ROOT%/}$orig_dir"
-                mkdir -p "$dest_dir"
-                tar -xzf "$proj_tar" -C "$dest_dir" || {
-                    log_error "恢复 Compose 项目 $proj_name 失败！"
-                    exit 1
-                }
-                log_info "已恢复 Compose 项目 [$proj_name] 到原路径: $dest_dir"
-            fi
-        done < "$COMPOSE_MANIFEST"
-    fi
+    # 7. 恢复 Named Volumes 至目标 DataRoot
+    log_info "正在恢复 Named Volumes 至: $TARGET_DATA_ABS..."
+    tar -xzf "$BACKUP_DIR/docker_volumes.tar.gz" -C "$TARGET_DATA_ABS" || {
+        log_error "解压 Named Volumes 失败！"
+        exit 1
+    }
 
     # 8. 启动 dockerd 并按原记录恢复开机自启
     if [ -x "$INIT_DOCKERD" ]; then
@@ -1010,24 +1231,48 @@ do_restore() {
         fi
     fi
 
-    # 9. 仅拉起本次备份记录的 Compose 项目（禁止扫描整个 /opt）
+    # 9. 仅拉起本次备份记录的 Compose 项目（严格使用记录的项目名、配置文件与环境变量文件）
     if [ -f "$COMPOSE_MANIFEST" ]; then
         while IFS='	' read -r proj_name orig_dir config_file || [ -n "$proj_name" ]; do
             [ -z "$proj_name" ] && continue
-            dest_dir="$orig_dir"
-            [ -n "$SYS_ROOT" ] && dest_dir="${SYS_ROOT%/}$orig_dir"
+            dest_dir=$(resolve_bind_path "$orig_dir")
             if [ -d "$dest_dir" ]; then
-                log_info "启动记录的 Compose 项目: $proj_name ($dest_dir)..."
+                log_info "启动记录的 Compose 项目: $proj_name (目录: $dest_dir)..."
+
+                actual_cfg=""
+                if [ -n "$config_file" ]; then
+                    actual_cfg=$(resolve_bind_path "$config_file")
+                    if [ ! -f "$actual_cfg" ] && [ -f "$dest_dir/docker-compose.yml" ]; then
+                        actual_cfg="$dest_dir/docker-compose.yml"
+                    elif [ ! -f "$actual_cfg" ] && [ -f "$dest_dir/compose.yaml" ]; then
+                        actual_cfg="$dest_dir/compose.yaml"
+                    fi
+                fi
+
+                compose_cmd=""
                 if command -v docker-compose >/dev/null 2>&1; then
-                    (cd "$dest_dir" && docker-compose up -d) || {
-                        log_error "启动 Compose 项目 $proj_name 失败！"
-                        exit 1
-                    }
+                    compose_cmd="docker-compose"
                 elif command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
-                    (cd "$dest_dir" && docker compose up -d) || {
+                    compose_cmd="docker compose"
+                fi
+
+                if [ -n "$compose_cmd" ]; then
+                    run_cmd="$compose_cmd -p \"$proj_name\""
+                    if [ -n "$actual_cfg" ] && [ -f "$actual_cfg" ]; then
+                        run_cmd="$run_cmd -f \"$actual_cfg\""
+                    fi
+                    if [ -f "$dest_dir/.env" ]; then
+                        run_cmd="$run_cmd --env-file \"$dest_dir/.env\""
+                    fi
+                    run_cmd="$run_cmd up -d"
+
+                    log_info "执行 Compose 启动命令: $run_cmd"
+                    (cd "$dest_dir" && eval "$run_cmd") || {
                         log_error "启动 Compose 项目 $proj_name 失败！"
                         exit 1
                     }
+                else
+                    log_warn "未找到 docker-compose 或 docker compose 命令，跳过 Compose 项目 $proj_name 启动"
                 fi
             fi
         done < "$COMPOSE_MANIFEST"
@@ -1176,8 +1421,38 @@ do_verify_runtime() {
                         fi
                     fi
                     if [ -z "$SOCKS_PORT" ]; then
-                        PORT_MATCH=$(grep -o '"port": *[0-9]*' "$cfg" 2>/dev/null | head -n 1 | awk '{print $2}' || true)
-                        [ -n "$PORT_MATCH" ] && SOCKS_PORT="$PORT_MATCH"
+                        if command -v jq >/dev/null 2>&1; then
+                            SOCKS_PORT=$(jq -r '.inbounds[]? | select((.protocol? == "socks") or (.type? == "socks") or ((.tag? // "") | test("socks"; "i"))) | (.listen_port // .port // empty)' "$cfg" 2>/dev/null | head -n 1 || true)
+                        fi
+                        if [ -z "$SOCKS_PORT" ]; then
+                            # 使用 awk 严格在 inbounds 节区内提取 socks 监听端口，杜绝截取 outbounds 远程服务器端口
+                            SOCKS_PORT=$(awk '
+                                BEGIN { in_inb=0; in_socks=0; depth=0; port="" }
+                                /"inbounds"[[:space:]]*:/ { in_inb=1 }
+                                in_inb && /\{/ { depth++ }
+                                in_inb && (/"protocol"[[:space:]]*:[[:space:]]*"socks"/ || /"type"[[:space:]]*:[[:space:]]*"socks"/ || /"tag"[[:space:]]*:[[:space:]]*"[^"]*socks[^"]*"/) { in_socks=1 }
+                                in_inb && in_socks && /"(listen_port|port)"[[:space:]]*:/ {
+                                    match($0, /"(listen_port|port)"[[:space:]]*:[[:space:]]*[0-9]+/)
+                                    if (RLENGTH > 0) {
+                                        str = substr($0, RSTART, RLENGTH)
+                                        split(str, arr, ":")
+                                        gsub(/[[:space:]]/, "", arr[2])
+                                        port = arr[2]
+                                        print port
+                                        exit
+                                    }
+                                }
+                                in_inb && /\}/ {
+                                    if (in_socks) in_socks=0
+                                    depth--
+                                    if (depth <= 0) in_inb=0
+                                }
+                            ' "$cfg" 2>/dev/null || true)
+                        fi
+                        if [ -z "$SOCKS_PORT" ]; then
+                            # 回退在 inbounds 边界内查找首个 listen_port 或 port (严格拦截 outbounds 以后)
+                            SOCKS_PORT=$(sed -n '/"inbounds"/,/"outbounds"/p' "$cfg" 2>/dev/null | grep -oE '"(listen_port|port)": *[0-9]+' | head -n 1 | awk '{print $2}' || true)
+                        fi
                     fi
                 done
             fi
@@ -1187,10 +1462,10 @@ do_verify_runtime() {
             fi
 
             if [ -z "$SOCKS_PORT" ]; then
-                log_error "未能从实际配置中定位 PassWall2 SOCKS 端口 (禁止盲猜默认 1080)！"
+                log_error "未能从 inbounds 配置中定位 PassWall2 本地 SOCKS 监听端口 (禁止截取 outbounds 或盲猜默认 1080)！"
                 FAILED=1
             else
-                log_info "定位到活动核心 SOCKS 端口: $SOCKS_PORT"
+                log_info "定位到活动核心 SOCKS 本地监听端口: $SOCKS_PORT"
                 if ! command -v curl >/dev/null 2>&1; then
                     log_error "缺少 curl 工具，无法发起 SOCKS 代理握手测试！"
                     FAILED=1
@@ -1234,22 +1509,40 @@ do_verify_runtime() {
     if [ "$CHECK_TARGET" = "all" ] || [ "$CHECK_TARGET" = "ppe" ]; then
         log_info "=== 验证 PPE 硬件加速与 Flowtable ==="
         PPE_OK=0
+        HAS_HW_OFFLOAD=0
+        HAS_SW_FLOWTABLE=0
+
         if command -v nft >/dev/null 2>&1; then
-            if nft list tables 2>/dev/null | grep -q "flowtable" || nft list ruleset 2>/dev/null | grep -q "flowtable"; then
-                PPE_OK=1
+            RULESET=$(nft list ruleset 2>/dev/null || nft list tables 2>/dev/null || true)
+            if echo "$RULESET" | grep -q "flowtable"; then
+                HAS_SW_FLOWTABLE=1
+                if echo "$RULESET" | grep -qE "flags[[:space:]]*=[[:space:]]*\{[[:space:]]*hw_offload[[:space:]]*\}|hw_offload"; then
+                    HAS_HW_OFFLOAD=1
+                fi
             fi
         fi
 
         DMESG_TEXT=$(dmesg 2>/dev/null || true)
-        if echo "$DMESG_TEXT" | grep -qiE "(ppe|flowtable).*(fail|error|disabled|cannot|timed out)"; then
-            log_error "dmesg 检测到 PPE/Flowtable 初始化失败或报错日志，硬件加速未正常生效！"
-            PPE_OK=0
+        PPE_DRIVER_FAIL=0
+        if echo "$DMESG_TEXT" | grep -qiE "(ppe|flowtable|qcom-ppe).*(fail|error|disabled|cannot|timed out)"; then
+            log_error "dmesg 检测到 PPE/Flowtable 驱动报错或探测失败 (probe failed)，硬件加速未正常生效！"
+            PPE_DRIVER_FAIL=1
         fi
 
-        if [ "$PPE_OK" -eq 1 ]; then
-            log_info "PPE / Flowtable 硬件卸载状态: 已生效"
+        if [ "$PPE_DRIVER_FAIL" -eq 1 ]; then
+            log_error "PPE 硬件加速异常：驱动探测或初始化失败！"
+            PPE_OK=0
+            FAILED=1
+        elif [ "$HAS_HW_OFFLOAD" -eq 1 ]; then
+            log_info "PPE 硬件加速状态: 已生效 (nftables flowtable 包含 hw_offload 硬件加速标志)"
+            PPE_OK=1
+        elif [ "$HAS_SW_FLOWTABLE" -eq 1 ]; then
+            log_error "仅检测到软件 Flowtable 流表，缺少 hw_offload 硬件卸载标志！Qualcomm PPE 硬件加速未生效！"
+            PPE_OK=0
+            FAILED=1
         else
-            log_error "PPE / Flowtable 硬件卸载未检测到生效或驱动报错！"
+            log_error "未检测到 Flowtable 流表规则或 PPE 硬件加速未开启！"
+            PPE_OK=0
             FAILED=1
         fi
     fi
