@@ -237,13 +237,13 @@ df -h | grep /mnt/sda1 || mount /mnt/sda1
     --target-data-root /mnt/sda1/docker_data
 ```
 还原流程包括：
-- 严格校验全局 `sha256sums.txt` 与组件清单，确保所有归档、脚本与配置无缺漏、未发生位翻转或损坏；
-- 预先核验所有恢复目标（DataRoot、Compose 目标目录、Bind Mounts 目标目录）的挂载安全性与存储设备，严禁任何未挂载外部盘的目标写入内部 `/overlay` 或 `/`；
+- 严格校验全局 `sha256sums.txt`、`backup_manifest.txt` 完整清单与所有备份组件（包括独立容器镜像归档与重建脚本、Compose 归档、Volumes 归档、Bind 归档及数据库转储），确保所有归档、脚本与配置无缺漏、未发生位翻转或损坏，任一缺失即刻阻断；
+- 预先核验所有恢复目标（DataRoot、Compose 目标目录、Bind Mounts 目标目录）的挂载安全性、所属存储设备与可用存储空间（确保空间满足各归档解压与冗余需求），严禁任何未挂载外部盘的目标写入内部 `/overlay` 或 `/`；
 - 恢复 `/etc/config/dockerd` 与 `/etc/docker/daemon.json` 配置，自动同步更新 `data_root` 路径；
 - 按照安全解压时序：先释放 Compose 编排目录结构，后解压释放 Bind Mounts 与 Named Volumes，确保冷备持久化数据绝对权威，绝不被 Compose 目录内的旧归档覆盖；
 - 启动 dockerd 守护进程并按原有状态恢复开机自启；
 - 仅拉起本次升级记录的 Compose 编排项目（严格使用记录的项目名 `-p`、配置文件 `-f` 与 `--env-file`）；
-- 按完整配置参数（环境变量 `-e`、端口映射 `-p`、数据挂载 `-v`、网络模式 `--net`、重启策略 `--restart`、特权 `--privileged`、启动命令与参数）重建独立容器；
+- 按完整配置参数（环境变量 `-e`、端口映射 `-p`、数据挂载 `-v`、网络模式 `--net`、重启策略 `--restart`、特权 `--privileged`、用户 `-u`、工作目录 `-w`、主机名 `-h`、入口点 `--entrypoint`、设备 `--device`、权限 `--cap-add`/`--cap-drop`、DNS `--dns`、启动命令与参数）安全单引号转义重建独立容器，并自动通过 `docker load` 恢复本地导出的镜像；
 - 若存在 SQL 备份文件，按需导入对应数据库。
 
 ---

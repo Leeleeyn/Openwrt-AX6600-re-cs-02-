@@ -93,6 +93,9 @@ case "$cmd" in
                 *"HostConfig.NetworkMode"*)
                     cat "$MOCK_STATE/cnet_$cid" 2>/dev/null || echo "bridge"
                     ;;
+                *"RestartPolicy.MaximumRetryCount"*)
+                    cat "$MOCK_STATE/crestart_max_$cid" 2>/dev/null || echo "0"
+                    ;;
                 *"RestartPolicy.Name"*)
                     cat "$MOCK_STATE/crestart_$cid" 2>/dev/null || echo "unless-stopped"
                     ;;
@@ -122,6 +125,27 @@ case "$cmd" in
                     ;;
                 *"HostConfig.Binds"*)
                     cat "$MOCK_STATE/binds_$cid" 2>/dev/null || true
+                    ;;
+                *"HostConfig.Devices"*)
+                    cat "$MOCK_STATE/cdevices_$cid" 2>/dev/null || true
+                    ;;
+                *"HostConfig.CapAdd"*)
+                    cat "$MOCK_STATE/ccapadd_$cid" 2>/dev/null || true
+                    ;;
+                *"HostConfig.CapDrop"*)
+                    cat "$MOCK_STATE/ccapdrop_$cid" 2>/dev/null || true
+                    ;;
+                *"HostConfig.Dns"*)
+                    cat "$MOCK_STATE/cdns_$cid" 2>/dev/null || true
+                    ;;
+                *"HostConfig.Links"*)
+                    cat "$MOCK_STATE/clinks_$cid" 2>/dev/null || echo "0"
+                    ;;
+                *"HostConfig.VolumesFrom"*)
+                    cat "$MOCK_STATE/cvfrom_$cid" 2>/dev/null || echo "0"
+                    ;;
+                *"HostConfig.Runtime"*)
+                    cat "$MOCK_STATE/cruntime_$cid" 2>/dev/null || echo "runc"
                     ;;
                 *"Config.Cmd"*)
                     cat "$MOCK_STATE/ccmd_$cid" 2>/dev/null || cat "$MOCK_STATE/cmd_$cid" 2>/dev/null || echo ""
@@ -158,8 +182,17 @@ case "$cmd" in
         if [ -f "$MOCK_STATE/docker_fail_save" ]; then
             exit 1
         fi
-        # 创建有效 tar 产物
-        tar -cf "$3" -T /dev/null 2>/dev/null || touch "$3"
+        out_tar=""
+        while [ $# -gt 0 ]; do
+            if [ "$1" = "-o" ]; then
+                out_tar="$2"
+                shift 2
+            else
+                shift
+            fi
+        done
+        [ -z "$out_tar" ] && out_tar="image.tar"
+        tar -cf "$out_tar" -T /dev/null 2>/dev/null || touch "$out_tar"
         exit 0
         ;;
     load)
@@ -296,6 +329,15 @@ case "$mode" in
         echo "/dev/mmcblk0p14        35328       68095       32768   0:HLOS_1"
         echo "/dev/mmcblk0p15        68096      190975      122880   rootfs"
         echo "/dev/mmcblk0p16       190976     1239551     1048576   rootfs_1"
+        ;;
+    small_kernel_target)
+        # 0:HLOS 是 2MB (4096 sectors), 0:HLOS_1 是 16MB (32768 sectors), rootfs 是 512MB
+        echo "Disk /dev/mmcblk0: 58.2 GiB"
+        echo "/dev/mmcblk0p2          2048        2559         512   0:BOOTCONFIG"
+        echo "/dev/mmcblk0p13         2560        6655        4096   0:HLOS"
+        echo "/dev/mmcblk0p14        35328       68095       32768   0:HLOS_1"
+        echo "/dev/mmcblk0p15        68096     1116671     1048576   rootfs"
+        echo "/dev/mmcblk0p16      1116672     2165247     1048576   rootfs_1"
         ;;
     dual_large_both)
         echo "Disk /dev/mmcblk0: 58.2 GiB"
@@ -833,6 +875,20 @@ EOF
     }
   },
   {
+    "Id": "standalone_no_diff_cid",
+    "Name": "/standalone_no_diff",
+    "Config": {
+      "Image": "busybox:latest",
+      "Labels": {}
+    },
+    "HostConfig": {
+      "NetworkMode": "bridge",
+      "RestartPolicy": { "Name": "on-failure", "MaximumRetryCount": 3 },
+      "Privileged": false,
+      "Binds": []
+    }
+  },
+  {
     "Id": "mysql_cid",
     "Name": "/mysql_db",
     "Config": {
@@ -848,7 +904,7 @@ EOF
   }
 ]
 EOF
-    echo -e "comp_cid\nstandalone_cid\nmysql_cid" > "$MOCK_STATE/containers_list_ids"
+    echo -e "comp_cid\nstandalone_cid\nstandalone_no_diff_cid\nmysql_cid" > "$MOCK_STATE/containers_list_ids"
     echo "my_proj" > "$MOCK_STATE/comp_project_comp_cid"
     echo "$ROUTER_COMPOSE" > "$MOCK_STATE/comp_workdir_comp_cid"
     echo "$ROUTER_COMPOSE/docker-compose.yml" > "$MOCK_STATE/comp_config_comp_cid"
@@ -869,7 +925,22 @@ EOF
     echo "0.0.0.0:8080:80/tcp" > "$MOCK_STATE/cports_standalone_cid"
     echo "STANDALONE_SECRET=super_secret_token_456" > "$MOCK_STATE/cenvs_standalone_cid"
     echo "$ROUTER_BIND/data:/data" > "$MOCK_STATE/binds_standalone_cid"
+    echo "/dev/net/tun:/dev/net/tun:rwm" > "$MOCK_STATE/cdevices_standalone_cid"
+    echo "NET_ADMIN" > "$MOCK_STATE/ccapadd_standalone_cid"
+    echo "SYS_RAWIO" > "$MOCK_STATE/ccapdrop_standalone_cid"
+    echo "1.1.1.1" > "$MOCK_STATE/cdns_standalone_cid"
     printf 'redis-server\n--protected-mode\nno\n' > "$MOCK_STATE/ccmd_standalone_cid"
+
+    # 独立容器 2: 无 diff，验证直接导出基础镜像并在脱机下通过 docker load 重建，且测试特殊字符环境变量单引号安全转义
+    echo "busybox:latest" > "$MOCK_STATE/cimg_standalone_no_diff_cid"
+    echo "standalone_no_diff" > "$MOCK_STATE/cname_standalone_no_diff_cid"
+    : > "$MOCK_STATE/diff_standalone_no_diff_cid"
+    echo "bridge" > "$MOCK_STATE/cnet_standalone_no_diff_cid"
+    echo "on-failure" > "$MOCK_STATE/crestart_standalone_no_diff_cid"
+    echo "3" > "$MOCK_STATE/crestart_max_standalone_no_diff_cid"
+    echo "false" > "$MOCK_STATE/cpriv_standalone_no_diff_cid"
+    echo "SPECIAL_ENV=test'value with space and \$dollar" > "$MOCK_STATE/cenvs_standalone_no_diff_cid"
+    printf 'sh\n-c\necho hello\n' > "$MOCK_STATE/ccmd_standalone_no_diff_cid"
 
     echo "mysql:8.0" > "$MOCK_STATE/cimg_mysql_cid"
     echo "mysql_db" > "$MOCK_STATE/cname_mysql_cid"
@@ -907,7 +978,14 @@ EOF
         echo "FAIL: 未生成统一备份清单 backup_manifest.txt！"
         exit 1
     fi
-    for req_item in "compose/my_proj.tar.gz" "standalone/recreate_standalone_app.sh" "standalone/image_standalone_app.tar" "docker_volumes.tar.gz" "docker_bind_mounts.tar.gz"; do
+    for req_item in \
+        "compose/my_proj.tar.gz" \
+        "standalone/recreate_standalone_app.sh" \
+        "standalone/image_standalone_app.tar" \
+        "standalone/recreate_standalone_no_diff.sh" \
+        "standalone/image_standalone_no_diff.tar" \
+        "docker_volumes.tar.gz" \
+        "docker_bind_mounts.tar.gz"; do
         if ! grep -q "$req_item" "$BKP_STORE/backup_manifest.txt"; then
             echo "FAIL: backup_manifest.txt 缺失项目: $req_item"
             exit 1
@@ -924,34 +1002,61 @@ EOF
         exit 1
     }
 
-    # 验证独立容器生成了重建脚本与快照镜像
+    # 验证独立容器 1 (有 diff) 生成了重建脚本与快照镜像
     REC_SCRIPT="$BKP_STORE/standalone/recreate_standalone_app.sh"
     if [ ! -f "$REC_SCRIPT" ] || [ ! -f "$BKP_STORE/standalone/image_standalone_app.tar" ]; then
         echo "FAIL: 独立容器重建脚本或快照镜像未生成！"
         exit 1
     fi
 
-    # 严格校验独立容器重建脚本内容覆盖所有参数: -e, -p, -v, --net, --restart, --privileged, -u, -w, -h, --entrypoint, Cmd
+    # 严格校验独立容器重建脚本内容覆盖所有参数（使用 POSIX 单引号字符转义）
     REC_CONTENT=$(cat "$REC_SCRIPT")
     for flag_pat in \
-        '--name "standalone_app"' \
-        '--net "bridge"' \
-        '--restart "always"' \
+        "--name 'standalone_app'" \
+        "--net 'bridge'" \
+        "--restart 'always'" \
         '--privileged' \
-        '-u "1000"' \
-        '-w "/workspace"' \
-        '-h "standalone-host"' \
-        '--entrypoint "/entrypoint.sh"' \
-        '-p "0.0.0.0:8080:80/tcp"' \
-        '-e "STANDALONE_SECRET=super_secret_token_456"' \
-        "-v \"$ROUTER_BIND/data:/data\"" \
-        '"backup-snapshot-standalone_app:latest"' \
-        '"redis-server"' \
-        '"--protected-mode"' \
-        '"no"'; do
+        "-u '1000'" \
+        "-w '/workspace'" \
+        "-h 'standalone-host'" \
+        "--entrypoint '/entrypoint.sh'" \
+        "-p '0.0.0.0:8080:80/tcp'" \
+        "-e 'STANDALONE_SECRET=super_secret_token_456'" \
+        "-v '$ROUTER_BIND/data:/data'" \
+        "--device '/dev/net/tun:/dev/net/tun:rwm'" \
+        "--cap-add 'NET_ADMIN'" \
+        "--cap-drop 'SYS_RAWIO'" \
+        "--dns '1.1.1.1'" \
+        "'backup-snapshot-standalone_app:latest'" \
+        "'redis-server'" \
+        "'--protected-mode'" \
+        "'no'"; do
         if ! echo "$REC_CONTENT" | grep -F -q -- "$flag_pat"; then
             echo "FAIL: 独立容器重建脚本遗漏参数: $flag_pat"
             echo "重建脚本全文: $REC_CONTENT"
+            exit 1
+        fi
+    done
+
+    # 验证独立容器 2 (无可写层 diff) 导出了基础镜像并在脚本中包含 docker load 与安全转义
+    REC_NO_DIFF="$BKP_STORE/standalone/recreate_standalone_no_diff.sh"
+    if [ ! -f "$REC_NO_DIFF" ] || [ ! -f "$BKP_STORE/standalone/image_standalone_no_diff.tar" ]; then
+        echo "FAIL: 无 diff 独立容器基础镜像或重建脚本未生成！"
+        exit 1
+    fi
+    REC_NO_DIFF_CONTENT=$(cat "$REC_NO_DIFF")
+    for flag_pat in \
+        'docker load -i "$STANDALONE_DIR/image_standalone_no_diff.tar"' \
+        "--name 'standalone_no_diff'" \
+        "--restart 'on-failure:3'" \
+        "-e 'SPECIAL_ENV=test'\"'\"'value with space and \$dollar'" \
+        "'busybox:latest'" \
+        "'sh'" \
+        "'-c'" \
+        "'echo hello'"; do
+        if ! echo "$REC_NO_DIFF_CONTENT" | grep -F -q -- "$flag_pat"; then
+            echo "FAIL: 无 diff 独立容器重建脚本缺少预期内容: $flag_pat"
+            echo "重建脚本全文: $REC_NO_DIFF_CONTENT"
             exit 1
         fi
     done
@@ -1103,21 +1208,28 @@ echo "--- 测试 8: 镜像校验与双分区容量安全预检 ---"
         exit 1
     fi
 
-    # 8d: 系统只读体检模式验证 (识别固件、硬件型号与分区)
-    echo "DISTRIB_DESCRIPTION='OpenWrt 23.05-SNAPSHOT'" > "$SYS_ROOT/etc/openwrt_release"
-    mkdir -p "$SYS_ROOT/tmp/sysinfo"
-    echo "JDCloud AX6600 (RE-CS-02)" > "$SYS_ROOT/tmp/sysinfo/model"
-    sh "$HELPER_SCRIPT" precheck --system-only --sys-root "$SYS_ROOT" > "$TEST_SANDBOX/t8_sys.log"
-    if ! grep -q "当前固件: OpenWrt 23.05-SNAPSHOT" "$TEST_SANDBOX/t8_sys.log"; then
-        echo "FAIL: 系统预检未能正确识别固件描述！"
+    # 8e: 目标内核分区容量不足 4MB 严格拦截 (small_kernel_target 模式下 0:HLOS 仅 2MB)
+    echo "small_kernel_target" > "$MOCK_STATE/fdisk_mode"
+    head -c 148 /dev/zero > "$SYS_ROOT/dev/mmcblk0p2"
+    printf '\x00' >> "$SYS_ROOT/dev/mmcblk0p2"
+    head -c 363 /dev/zero >> "$SYS_ROOT/dev/mmcblk0p2"
+
+    set +e
+    sh "$HELPER_SCRIPT" precheck "$IMG_FILE" "$SHA_EXPECTED" --sys-root "$SYS_ROOT" 2>"$TEST_SANDBOX/t8_kern.log"
+    ret=$?
+    set -e
+    rm -f "$MOCK_STATE/fdisk_mode" "$SYS_ROOT/dev/mmcblk0p2"
+
+    if [ "$ret" -eq 0 ]; then
+        echo "FAIL: 目标内核分区仅 2MB (< 4MB)，预检竟然放行！"
         exit 1
     fi
-    if ! grep -q "设备型号: JDCloud AX6600" "$TEST_SANDBOX/t8_sys.log"; then
-        echo "FAIL: 系统预检未能正确识别设备型号！"
+    if ! grep -qiE "(待升级目标内核分区.*小于 4MB 安全阈值|容量仅为 2MB)" "$TEST_SANDBOX/t8_kern.log"; then
+        echo "FAIL: 内核分区过小拦截报错信息异常: $(cat "$TEST_SANDBOX/t8_kern.log")"
         exit 1
     fi
 )
-echo "PASS: 测试 8 通过（镜像预检严格，系统只读体检输出完整，双分区未误取较大者）"
+echo "PASS: 测试 8 通过（镜像预检严格，系统只读体检输出完整，双分区与内核容量安全核验完整）"
 
 # -----------------------------------------------------------------------------
 # 测试 9: NSS 清理严格匹配（节类型为 include 且路径精确匹配，并自动备份旧配置）
@@ -1310,6 +1422,42 @@ EOF_PW
         echo "FAIL: 未能定位到 1080 或误提取了 8443: $(cat "$TEST_SANDBOX/t10_pw_inb.log")"
         exit 1
     fi
+
+    # 10j: PassWall2 配置文件 port 在 protocol 前且包含嵌套 settings 对象时，必须精准提取 inbounds 本地 socks 端口 (1080)
+    touch "$MOCK_STATE/pgrep_running_sing-box"
+    cat << 'EOF_PW_NESTED' > "$SYS_ROOT/var/etc/passwall2/TCP.json"
+{
+  "outbounds": [
+    {
+      "protocol": "shadowsocks",
+      "server_port": 8443
+    }
+  ],
+  "inbounds": [
+    {
+      "port": 1080,
+      "protocol": "socks",
+      "settings": {
+        "auth": "noauth",
+        "udp": true
+      }
+    }
+  ]
+}
+EOF_PW_NESTED
+    set +e
+    sh "$HELPER_SCRIPT" verify passwall --sys-root "$SYS_ROOT" >"$TEST_SANDBOX/t10_pw_nested.log" 2>&1
+    ret=$?
+    set -e
+    rm -f "$MOCK_STATE/pgrep_running_sing-box" "$SYS_ROOT/var/etc/passwall2/TCP.json"
+    if [ "$ret" -ne 0 ]; then
+        echo "FAIL: PassWall2 port 在前且含嵌套对象时握手失败: $(cat "$TEST_SANDBOX/t10_pw_nested.log")"
+        exit 1
+    fi
+    if ! grep -q "定位到活动核心 SOCKS 本地监听端口: 1080" "$TEST_SANDBOX/t10_pw_nested.log"; then
+        echo "FAIL: 未能定位到 port 在前且含嵌套对象的 1080 端口: $(cat "$TEST_SANDBOX/t10_pw_nested.log")"
+        exit 1
+    fi
 )
 echo "PASS: 测试 10 通过（运行时验收各项失败分支均有效阻断，inbounds 端口精准提取，硬件 flowtable 校验完整）"
 
@@ -1393,8 +1541,48 @@ echo "--- 测试 12: 备份完整性、缺失项与哈希篡改拦截验证 ---"
         echo "FAIL: 缺失 Compose 归档报错信息异常: $(cat "$TEST_SANDBOX/t12_comp_missing.log")"
         exit 1
     fi
+
+    # 12d: 独立容器镜像归档缺失 (删除 standalone/image_standalone_app.tar) 必须被拦截
+    rm -rf "$T12_BKP"
+    cp -r "$BKP_STORE" "$T12_BKP"
+    rm -f "$T12_BKP/standalone/image_standalone_app.tar"
+    set +e
+    sh "$T12_BKP/docker_upgrade_helper.sh" restore \
+        --backup-dir "$T12_BKP" \
+        --target-data-root "$DST_DOCKER" \
+        --sys-root "$SYS_ROOT" 2>"$TEST_SANDBOX/t12_img_missing.log"
+    ret=$?
+    set -e
+    if [ "$ret" -eq 0 ]; then
+        echo "FAIL: 缺失独立容器镜像归档时恢复竟然放行！"
+        exit 1
+    fi
+    if ! grep -qiE "(关键备份文件缺失|缺少|校验失败)" "$TEST_SANDBOX/t12_img_missing.log"; then
+        echo "FAIL: 缺失独立容器镜像归档报错信息异常: $(cat "$TEST_SANDBOX/t12_img_missing.log")"
+        exit 1
+    fi
+
+    # 12e: 独立容器重建脚本缺失 (删除 standalone/recreate_standalone_app.sh) 必须被拦截
+    rm -rf "$T12_BKP"
+    cp -r "$BKP_STORE" "$T12_BKP"
+    rm -f "$T12_BKP/standalone/recreate_standalone_app.sh"
+    set +e
+    sh "$T12_BKP/docker_upgrade_helper.sh" restore \
+        --backup-dir "$T12_BKP" \
+        --target-data-root "$DST_DOCKER" \
+        --sys-root "$SYS_ROOT" 2>"$TEST_SANDBOX/t12_rec_missing.log"
+    ret=$?
+    set -e
+    if [ "$ret" -eq 0 ]; then
+        echo "FAIL: 缺失独立容器重建脚本时恢复竟然放行！"
+        exit 1
+    fi
+    if ! grep -qiE "(关键备份文件缺失|缺少|校验失败)" "$TEST_SANDBOX/t12_rec_missing.log"; then
+        echo "FAIL: 缺失独立容器重建脚本报错信息异常: $(cat "$TEST_SANDBOX/t12_rec_missing.log")"
+        exit 1
+    fi
 )
-echo "PASS: 测试 12 通过（备份清单缺失项与哈希篡改均被严格拦截阻断恢复）"
+echo "PASS: 测试 12 通过（备份清单缺失项、独立容器构件缺失与哈希篡改均被严格拦截阻断恢复）"
 
 # -----------------------------------------------------------------------------
 # 测试 13: 恢复目标设备挂载安全性校验（DataRoot、Compose 路径、Bind 路径未挂载外部盘严格拦截）
@@ -1487,8 +1675,29 @@ echo "--- 测试 13: 恢复阶段全目标路径挂载安全性核验 ---"
         echo "FAIL: Bind Mount 挂载安全报错信息异常: $(cat "$TEST_SANDBOX/t13_bind.log")"
         exit 1
     fi
+
+    # 13d: 目标存储磁盘可用空间不足时严格拦截恢复
+    rm -rf "$T13_BKP"
+    cp -r "$BKP_STORE" "$T13_BKP"
+    echo "insufficient_space" > "$MOCK_STATE/df_mode"
+    set +e
+    sh "$T13_BKP/docker_upgrade_helper.sh" restore \
+        --backup-dir "$T13_BKP" \
+        --target-data-root "$DST_DOCKER" \
+        --sys-root "$SYS_ROOT" 2>"$TEST_SANDBOX/t13_space.log"
+    ret=$?
+    set -e
+    rm -f "$MOCK_STATE/df_mode"
+    if [ "$ret" -eq 0 ]; then
+        echo "FAIL: 目标存储空间不足时恢复竟然放行！"
+        exit 1
+    fi
+    if ! grep -qiE "(存储空间不足|空间不足)" "$TEST_SANDBOX/t13_space.log"; then
+        echo "FAIL: 空间不足报错信息异常: $(cat "$TEST_SANDBOX/t13_space.log")"
+        exit 1
+    fi
 )
-echo "PASS: 测试 13 通过（恢复阶段 DataRoot、Compose、Bind 目标路径未挂载外部盘全部被严格拦截）"
+echo "PASS: 测试 13 通过（恢复阶段 DataRoot、Compose、Bind 目标路径未挂载外部盘与空间不足全部被严格拦截）"
 
 # -----------------------------------------------------------------------------
 # 测试 14: 独立容器多网络拓扑备份阻断
@@ -1525,4 +1734,111 @@ echo "--- 测试 14: 独立容器连接多个网络备份阻断 ---"
 )
 echo "PASS: 测试 14 通过（连接多个网络的独立容器在备份阶段被成功阻断并提示迁移编排）"
 
-echo "=== 全部 14 项深度隔离测试与回归演练已通过！ ==="
+# -----------------------------------------------------------------------------
+# 测试 15: 独立容器不可还原高级特性在备份阶段严格阻断
+# -----------------------------------------------------------------------------
+echo "--- 测试 15: 独立容器高级特性与不可还原配置备份阻断 ---"
+(
+    MOCK_DOCKER_ROOT="$TEST_SANDBOX/t15_docker"
+    T15_TARGET="$TEST_SANDBOX/t15_target"
+    mkdir -p "$MOCK_DOCKER_ROOT/volumes" "$T15_TARGET"
+
+    # 15a: container 模式网络依赖
+    echo "c_net_dep_cid" > "$MOCK_STATE/containers_list_ids"
+    echo "c_net_dep" > "$MOCK_STATE/cname_c_net_dep_cid"
+    echo "alpine:latest" > "$MOCK_STATE/cimg_c_net_dep_cid"
+    echo "container:main_vpn" > "$MOCK_STATE/cnet_c_net_dep_cid"
+
+    set +e
+    sh "$HELPER_SCRIPT" backup \
+        --docker-dir "$MOCK_DOCKER_ROOT" \
+        --target-dir "$T15_TARGET" \
+        --sys-root "$SYS_ROOT" \
+        --skip-stop 2>"$TEST_SANDBOX/t15_cnet.log"
+    ret=$?
+    set -e
+    rm -f "$MOCK_STATE/containers_list_ids" "$MOCK_STATE/cnet_c_net_dep_cid"
+    if [ "$ret" -eq 0 ]; then
+        echo "FAIL: container 网络模式依赖容器备份竟然放行！"
+        exit 1
+    fi
+    if ! grep -q "网络模式依赖其他容器" "$TEST_SANDBOX/t15_cnet.log"; then
+        echo "FAIL: container 网络依赖报错信息异常: $(cat "$TEST_SANDBOX/t15_cnet.log")"
+        exit 1
+    fi
+
+    # 15b: Links 关联
+    echo "c_links_cid" > "$MOCK_STATE/containers_list_ids"
+    echo "c_links" > "$MOCK_STATE/cname_c_links_cid"
+    echo "alpine:latest" > "$MOCK_STATE/cimg_c_links_cid"
+    echo "1" > "$MOCK_STATE/clinks_c_links_cid"
+
+    set +e
+    sh "$HELPER_SCRIPT" backup \
+        --docker-dir "$MOCK_DOCKER_ROOT" \
+        --target-dir "$T15_TARGET" \
+        --sys-root "$SYS_ROOT" \
+        --skip-stop 2>"$TEST_SANDBOX/t15_links.log"
+    ret=$?
+    set -e
+    rm -f "$MOCK_STATE/containers_list_ids" "$MOCK_STATE/clinks_c_links_cid"
+    if [ "$ret" -eq 0 ]; then
+        echo "FAIL: Links 容器备份竟然放行！"
+        exit 1
+    fi
+    if ! grep -q "配置了 Links 容器关联" "$TEST_SANDBOX/t15_links.log"; then
+        echo "FAIL: Links 报错信息异常: $(cat "$TEST_SANDBOX/t15_links.log")"
+        exit 1
+    fi
+
+    # 15c: VolumesFrom 卷共享
+    echo "c_vfrom_cid" > "$MOCK_STATE/containers_list_ids"
+    echo "c_vfrom" > "$MOCK_STATE/cname_c_vfrom_cid"
+    echo "alpine:latest" > "$MOCK_STATE/cimg_c_vfrom_cid"
+    echo "1" > "$MOCK_STATE/cvfrom_c_vfrom_cid"
+
+    set +e
+    sh "$HELPER_SCRIPT" backup \
+        --docker-dir "$MOCK_DOCKER_ROOT" \
+        --target-dir "$T15_TARGET" \
+        --sys-root "$SYS_ROOT" \
+        --skip-stop 2>"$TEST_SANDBOX/t15_vfrom.log"
+    ret=$?
+    set -e
+    rm -f "$MOCK_STATE/containers_list_ids" "$MOCK_STATE/cvfrom_c_vfrom_cid"
+    if [ "$ret" -eq 0 ]; then
+        echo "FAIL: VolumesFrom 容器备份竟然放行！"
+        exit 1
+    fi
+    if ! grep -q "依赖了其他容器的数据卷" "$TEST_SANDBOX/t15_vfrom.log"; then
+        echo "FAIL: VolumesFrom 报错信息异常: $(cat "$TEST_SANDBOX/t15_vfrom.log")"
+        exit 1
+    fi
+
+    # 15d: 自定义 Runtime
+    echo "c_runtime_cid" > "$MOCK_STATE/containers_list_ids"
+    echo "c_runtime" > "$MOCK_STATE/cname_c_runtime_cid"
+    echo "alpine:latest" > "$MOCK_STATE/cimg_c_runtime_cid"
+    echo "nvidia" > "$MOCK_STATE/cruntime_c_runtime_cid"
+
+    set +e
+    sh "$HELPER_SCRIPT" backup \
+        --docker-dir "$MOCK_DOCKER_ROOT" \
+        --target-dir "$T15_TARGET" \
+        --sys-root "$SYS_ROOT" \
+        --skip-stop 2>"$TEST_SANDBOX/t15_runtime.log"
+    ret=$?
+    set -e
+    rm -f "$MOCK_STATE/containers_list_ids" "$MOCK_STATE/cruntime_c_runtime_cid"
+    if [ "$ret" -eq 0 ]; then
+        echo "FAIL: 自定义 Runtime 容器备份竟然放行！"
+        exit 1
+    fi
+    if ! grep -q "使用了自定义运行时" "$TEST_SANDBOX/t15_runtime.log"; then
+        echo "FAIL: Runtime 报错信息异常: $(cat "$TEST_SANDBOX/t15_runtime.log")"
+        exit 1
+    fi
+)
+echo "PASS: 测试 15 通过（Links、VolumesFrom、container 模式与自定义运行时均在备份阶段被成功阻断）"
+
+echo "=== 全部 15 项深度隔离测试与回归演练已通过！ ==="

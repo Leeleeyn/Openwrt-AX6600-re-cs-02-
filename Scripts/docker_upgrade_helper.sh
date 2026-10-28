@@ -59,10 +59,21 @@ resolve_bind_path() {
     fi
 }
 
-# 挂载安全性与存储介质类型核查（支持对尚未创建的目标路径向上查找其已挂载的祖先目录）
+# POSIX shell 字符安全转义（用于生成安全的单引号命令参数）
+sh_escape() {
+    printf "%s" "$1" | sed "s/'/'\"'\"'/g"
+}
+
+# 挂载安全性与存储介质类型核查（支持对尚未创建的目标路径向上查找其已挂载的祖先目录，并核验设备、挂载和可用空间）
 check_mount_safety() {
     target_path="$1"
     label="$2"
+    min_need_kb="${3:-0}"
+
+    [ -z "$target_path" ] && {
+        log_error "$label 路径为空！"
+        exit 1
+    }
 
     check_dir="$target_path"
     while [ ! -d "$check_dir" ] && [ "$check_dir" != "/" ] && [ "$check_dir" != "." ]; do
@@ -103,6 +114,14 @@ check_mount_safety() {
             exit 1
             ;;
     esac
+
+    # 核验存储可用空间
+    if [ "$min_need_kb" -gt 0 ]; then
+        if [ -z "$avail_kb" ] || [ "$avail_kb" -lt "$min_need_kb" ]; then
+            log_error "$label 存储空间不足！可用: ${avail_kb:-0}KB，所需估算: ${min_need_kb}KB"
+            exit 1
+        fi
+    fi
 }
 
 # 剩余空间核查
@@ -212,6 +231,14 @@ do_precheck() {
             [ "$OD_HEX" = "01" ] && PART_NUM="1"
             [ "$OD_HEX" = "00" ] && PART_NUM="0"
         fi
+        if [ -z "$PART_NUM" ] && command -v dd >/dev/null 2>&1; then
+            RAW_BYTE=$(dd if="$CFGPART" bs=1 skip=148 count=1 2>/dev/null || true)
+            if [ "$RAW_BYTE" = "$(printf '\001')" ] || [ "$RAW_BYTE" = "1" ]; then
+                PART_NUM="1"
+            elif [ -n "$RAW_BYTE" ]; then
+                PART_NUM="0"
+            fi
+        fi
         if [ -n "$PART_NUM" ]; then
             TARGET_SRC="0:BOOTCONFIG 分区偏移 148 字节标记 ($PART_NUM)"
         fi
@@ -222,7 +249,8 @@ do_precheck() {
     if [ "$PART_NUM" = "1" ]; then
         TARGET_KERN="0:HLOS_1"
         TARGET_ROOTFS="rootfs_1"
-    elif [ "$PART_NUM" = "0" ]; then
+    elif [ -n "$PART_NUM" ]; then
+        # 严格对齐 qualcommax platform.sh: 读取到 BOOTCONFIG 且非 1 时写入 0:HLOS 与 rootfs
         TARGET_KERN="0:HLOS"
         TARGET_ROOTFS="rootfs"
     else
@@ -374,7 +402,12 @@ do_precheck() {
         fi
         log_info "固件平台兼容性校验通过"
 
-        # 目标根文件系统容量安全阈值核验 (严禁在未扩容的原厂 60MB 双分区刷入 PLUS 版)
+        # 目标内核与根文件系统容量安全阈值核验 (分别严格检查内核目标与根文件系统目标)
+        if [ "$TARGET_KERN_MB" -lt 4 ]; then
+            log_error "待升级目标内核分区 [$TARGET_KERN] 容量仅为 ${TARGET_KERN_MB}MB，小于 4MB 安全阈值！禁止盲刷！"
+            exit 1
+        fi
+
         if [ "$TARGET_ROOTFS_MB" -lt 200 ]; then
             log_error "待升级目标根文件系统分区 [$TARGET_ROOTFS] 容量仅为 ${TARGET_ROOTFS_MB}MB，小于 200MB 安全阈值！严禁在未扩容的分区刷入 PLUS 完整版固件！请选择 PURE 纯净版或通过 U-Boot 重新分区扩容。"
             exit 1
@@ -626,14 +659,43 @@ do_backup() {
                     fi
                     echo "$cname" >> "$STANDALONE_MANIFEST"
 
-                    # 检查高级网络配置：若容器连接了多个网络，单一 docker run 无法精准还原，备份阶段必须明确阻断
+                    # 检查高级/不受支持配置：遇到无法精准还原的参数在备份阶段明确阻断
                     net_count=$(docker inspect -f '{{len .NetworkSettings.Networks}}' "$cid" 2>/dev/null || echo 1)
+                    case "$net_count" in ''|*[!0-9]*) net_count=1 ;; esac
                     if [ "$net_count" -gt 1 ]; then
                         log_error "独立容器 $cname 连接了多个网络 ($net_count 个)，单一 docker run 无法还原多网络拓扑！为防止配置丢失，已在备份阶段阻断。请将其迁移为 Docker Compose 编排管理。"
                         exit 1
                     fi
 
-                    # 检查可写层改动
+                    cnet=$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$cid" 2>/dev/null || true)
+                    case "$cnet" in
+                        container:*)
+                            log_error "独立容器 $cname 网络模式依赖其他容器 ($cnet)，无法单独重建！为防止配置丢失，已在备份阶段阻断。请将其迁移为 Docker Compose 编排管理。"
+                            exit 1
+                            ;;
+                    esac
+
+                    links_cnt=$(docker inspect -f '{{len .HostConfig.Links}}' "$cid" 2>/dev/null || echo 0)
+                    case "$links_cnt" in ''|*[!0-9]*) links_cnt=0 ;; esac
+                    if [ "$links_cnt" -gt 0 ]; then
+                        log_error "独立容器 $cname 配置了 Links 容器关联，无法单命令可靠还原！为防止配置丢失，已在备份阶段阻断。请将其迁移为 Docker Compose 编排管理。"
+                        exit 1
+                    fi
+
+                    vfrom_cnt=$(docker inspect -f '{{len .HostConfig.VolumesFrom}}' "$cid" 2>/dev/null || echo 0)
+                    case "$vfrom_cnt" in ''|*[!0-9]*) vfrom_cnt=0 ;; esac
+                    if [ "$vfrom_cnt" -gt 0 ]; then
+                        log_error "独立容器 $cname 依赖了其他容器的数据卷 (--volumes-from)，无法单命令还原依赖顺序！为防止配置丢失，已在备份阶段阻断。请将其迁移为 Docker Compose 编排管理。"
+                        exit 1
+                    fi
+
+                    cruntime=$(docker inspect -f '{{.HostConfig.Runtime}}' "$cid" 2>/dev/null || true)
+                    if [ -n "$cruntime" ] && [ "$cruntime" != "runc" ] && [ "$cruntime" != "default" ]; then
+                        log_error "独立容器 $cname 使用了自定义运行时 ($cruntime)，当前系统无法保证还原！已在备份阶段阻断。"
+                        exit 1
+                    fi
+
+                    # 导出镜像（有可写层改动则 commit 快照，无可写层变动则直接导出基础镜像，确保脱机可恢复）
                     has_diff=0
                     diff_out=$(docker diff "$cid" 2>/dev/null || true)
                     filtered_diff=$(echo "$diff_out" | grep -vE "^[ACD] (/tmp|/run|/var/log|/var/run|/dev)" || true)
@@ -651,14 +713,26 @@ do_backup() {
                             exit 1
                         }
                         img_for_run="$snap_tag"
-                        i_kb=$(du -sk "$STANDALONE_STORE/image_${cname}.tar" 2>/dev/null | awk '{print $1}' || echo 0)
-                        TOTAL_NEED_KB=$((TOTAL_NEED_KB + i_kb))
+                    else
+                        log_info "容器 $cname 可写层无变动，导出基础镜像: $cimg ..."
+                        docker save "$cimg" -o "$STANDALONE_STORE/image_${cname}.tar" || {
+                            log_error "导出容器 $cname 基础镜像 $cimg 失败！"
+                            exit 1
+                        }
+                    fi
+                    i_kb=$(du -sk "$STANDALONE_STORE/image_${cname}.tar" 2>/dev/null | awk '{print $1}' || echo 0)
+                    TOTAL_NEED_KB=$((TOTAL_NEED_KB + i_kb))
+
+                    # 生成独立容器重建脚本（完整还原支持的设置：-e, -p, -v, --net, --restart, --privileged, -u, -w, -h, --entrypoint, --device, --cap-add, --cap-drop, --dns, Cmd）
+                    rec_script="$STANDALONE_STORE/recreate_${cname}.sh"
+                    crestart_name=$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$cid" 2>/dev/null || true)
+                    crestart_max=$(docker inspect -f '{{.HostConfig.RestartPolicy.MaximumRetryCount}}' "$cid" 2>/dev/null || true)
+                    case "$crestart_max" in ''|*[!0-9]*) crestart_max=0 ;; esac
+                    crestart="$crestart_name"
+                    if [ "$crestart_name" = "on-failure" ] && [ -n "$crestart_max" ] && [ "$crestart_max" -gt 0 ]; then
+                        crestart="on-failure:$crestart_max"
                     fi
 
-                    # 生成独立容器重建脚本（完整还原支持的设置：-e, -p, -v, --net, --restart, --privileged, -u, -w, -h, --entrypoint, Cmd）
-                    rec_script="$STANDALONE_STORE/recreate_${cname}.sh"
-                    cnet=$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$cid" 2>/dev/null || true)
-                    crestart=$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$cid" 2>/dev/null || true)
                     cpriv=$(docker inspect -f '{{.HostConfig.Privileged}}' "$cid" 2>/dev/null || true)
                     cuser=$(docker inspect -f '{{.Config.User}}' "$cid" 2>/dev/null || true)
                     cworkdir=$(docker inspect -f '{{.Config.WorkingDir}}' "$cid" 2>/dev/null || true)
@@ -675,59 +749,100 @@ do_backup() {
                     cbinds=$(docker inspect -f '{{range .HostConfig.Binds}}{{.}}
 {{end}}' "$cid" 2>/dev/null || true)
 
+                    cdevices=$(docker inspect -f '{{range .HostConfig.Devices}}{{.PathOnHost}}:{{.PathInContainer}}:{{.CgroupPermissions}}
+{{end}}' "$cid" 2>/dev/null || true)
+
+                    ccaps_add=$(docker inspect -f '{{range .HostConfig.CapAdd}}{{.}}
+{{end}}' "$cid" 2>/dev/null || true)
+
+                    ccaps_drop=$(docker inspect -f '{{range .HostConfig.CapDrop}}{{.}}
+{{end}}' "$cid" 2>/dev/null || true)
+
+                    cdns=$(docker inspect -f '{{range .HostConfig.Dns}}{{.}}
+{{end}}' "$cid" 2>/dev/null || true)
+
                     ccmd=$(docker inspect -f '{{range .Config.Cmd}}{{.}}
 {{end}}' "$cid" 2>/dev/null || true)
 
                     cat << EOF_REC > "$rec_script"
 #!/bin/sh
 set -e
+STANDALONE_DIR="\${STANDALONE_DIR:-\$(cd "\$(dirname "\$0")" && pwd -P)}"
 echo "正在重建独立容器: $cname..."
 docker rm -f "$cname" 2>/dev/null || true
+if [ -f "\$STANDALONE_DIR/image_${cname}.tar" ]; then
+    docker load -i "\$STANDALONE_DIR/image_${cname}.tar"
+fi
 EOF_REC
-                    if [ "$has_diff" -eq 1 ]; then
-                        echo "docker load -i \"\$STANDALONE_DIR/image_${cname}.tar\"" >> "$rec_script"
-                    fi
 
-                    printf 'docker run -d --name "%s"' "$cname" >> "$rec_script"
-                    [ -n "$cnet" ] && [ "$cnet" != "default" ] && printf ' --net "%s"' "$cnet" >> "$rec_script"
-                    [ -n "$crestart" ] && [ "$crestart" != "no" ] && printf ' --restart "%s"' "$crestart" >> "$rec_script"
-                    [ "$cpriv" = "true" ] && printf ' --privileged' >> "$rec_script"
-                    [ -n "$cuser" ] && printf ' -u "%s"' "$cuser" >> "$rec_script"
-                    [ -n "$cworkdir" ] && printf ' -w "%s"' "$cworkdir" >> "$rec_script"
-                    [ -n "$chostname" ] && printf ' -h "%s"' "$chostname" >> "$rec_script"
-                    [ -n "$centrypoint" ] && printf ' --entrypoint "%s"' "$centrypoint" >> "$rec_script"
+                    printf "docker run -d --name '%s'" "$(sh_escape "$cname")" >> "$rec_script"
+                    [ -n "$cnet" ] && [ "$cnet" != "default" ] && printf " --net '%s'" "$(sh_escape "$cnet")" >> "$rec_script"
+                    [ -n "$crestart" ] && [ "$crestart" != "no" ] && printf " --restart '%s'" "$(sh_escape "$crestart")" >> "$rec_script"
+                    [ "$cpriv" = "true" ] && printf " --privileged" >> "$rec_script"
+                    [ -n "$cuser" ] && printf " -u '%s'" "$(sh_escape "$cuser")" >> "$rec_script"
+                    [ -n "$cworkdir" ] && printf " -w '%s'" "$(sh_escape "$cworkdir")" >> "$rec_script"
+                    [ -n "$chostname" ] && printf " -h '%s'" "$(sh_escape "$chostname")" >> "$rec_script"
+                    [ -n "$centrypoint" ] && printf " --entrypoint '%s'" "$(sh_escape "$centrypoint")" >> "$rec_script"
 
                     if [ -n "$cports" ]; then
                         echo "$cports" | while IFS= read -r p_item || [ -n "$p_item" ]; do
                             [ -z "$p_item" ] && continue
-                            printf ' -p "%s"' "$p_item" >> "$rec_script"
+                            printf " -p '%s'" "$(sh_escape "$p_item")" >> "$rec_script"
                         done
                     fi
 
                     if [ -n "$cenvs" ]; then
                         echo "$cenvs" | while IFS= read -r e_item || [ -n "$e_item" ]; do
                             [ -z "$e_item" ] && continue
-                            printf ' -e "%s"' "$e_item" >> "$rec_script"
+                            printf " -e '%s'" "$(sh_escape "$e_item")" >> "$rec_script"
                         done
                     fi
 
                     if [ -n "$cbinds" ]; then
                         echo "$cbinds" | while IFS= read -r b_item || [ -n "$b_item" ]; do
                             [ -z "$b_item" ] && continue
-                            printf ' -v "%s"' "$b_item" >> "$rec_script"
+                            printf " -v '%s'" "$(sh_escape "$b_item")" >> "$rec_script"
                         done
                     fi
 
-                    printf ' "%s"' "$img_for_run" >> "$rec_script"
+                    if [ -n "$cdevices" ]; then
+                        echo "$cdevices" | while IFS= read -r d_item || [ -n "$d_item" ]; do
+                            [ -z "$d_item" ] && continue
+                            printf " --device '%s'" "$(sh_escape "$d_item")" >> "$rec_script"
+                        done
+                    fi
+
+                    if [ -n "$ccaps_add" ]; then
+                        echo "$ccaps_add" | while IFS= read -r ca_item || [ -n "$ca_item" ]; do
+                            [ -z "$ca_item" ] && continue
+                            printf " --cap-add '%s'" "$(sh_escape "$ca_item")" >> "$rec_script"
+                        done
+                    fi
+
+                    if [ -n "$ccaps_drop" ]; then
+                        echo "$ccaps_drop" | while IFS= read -r cd_item || [ -n "$cd_item" ]; do
+                            [ -z "$cd_item" ] && continue
+                            printf " --cap-drop '%s'" "$(sh_escape "$cd_item")" >> "$rec_script"
+                        done
+                    fi
+
+                    if [ -n "$cdns" ]; then
+                        echo "$cdns" | while IFS= read -r dns_item || [ -n "$dns_item" ]; do
+                            [ -z "$dns_item" ] && continue
+                            printf " --dns '%s'" "$(sh_escape "$dns_item")" >> "$rec_script"
+                        done
+                    fi
+
+                    printf " '%s'" "$(sh_escape "$img_for_run")" >> "$rec_script"
 
                     if [ -n "$ccmd" ]; then
                         echo "$ccmd" | while IFS= read -r a_item || [ -n "$a_item" ]; do
                             [ -z "$a_item" ] && continue
-                            printf ' "%s"' "$a_item" >> "$rec_script"
+                            printf " '%s'" "$(sh_escape "$a_item")" >> "$rec_script"
                         done
                     fi
 
-                    printf '\n' >> "$rec_script"
+                    printf "\n" >> "$rec_script"
                     chmod +x "$rec_script"
                 fi
             done
@@ -1070,8 +1185,17 @@ do_restore() {
         while IFS= read -r cname || [ -n "$cname" ]; do
             [ -z "$cname" ] && continue
             rec_sh="$BACKUP_DIR/standalone/recreate_${cname}.sh"
+            img_tar="$BACKUP_DIR/standalone/image_${cname}.tar"
             if [ ! -f "$rec_sh" ]; then
                 log_error "关键备份文件缺失: 独立容器重建脚本 $rec_sh 不存在！禁止恢复！"
+                exit 1
+            fi
+            if [ ! -f "$img_tar" ]; then
+                log_error "关键备份文件缺失: 独立容器镜像归档 $img_tar 不存在！禁止恢复！"
+                exit 1
+            fi
+            if ! tar -tf "$img_tar" >/dev/null 2>&1; then
+                log_error "独立容器镜像归档 $img_tar 文件损坏！禁止恢复！"
                 exit 1
             fi
         done < "$STANDALONE_MANIFEST"
@@ -1089,27 +1213,55 @@ do_restore() {
         fi
     fi
 
-    # 2. 确认恢复端所有目标路径真实挂载在外部存储，严禁解压到内部 /overlay 或 /
-    log_info "正在预检全部恢复目标的挂载设备与安全性..."
+    # 遍历 backup_manifest.txt 中记录的所有文件，确保无一遗漏
+    in_files=0
+    while IFS= read -r mline || [ -n "$mline" ]; do
+        if [ "$mline" = "[FILES]" ]; then
+            in_files=1
+            continue
+        fi
+        [ "$in_files" -eq 1 ] || continue
+        [ -z "$mline" ] && continue
+        if [ ! -f "$BACKUP_DIR/$mline" ]; then
+            log_error "关键备份文件缺失: 清单记录的文件 $mline 不存在！禁止恢复！"
+            exit 1
+        fi
+    done < "$BACKUP_DIR/backup_manifest.txt"
+
+    # 2. 确认恢复端所有目标路径真实挂载在外部存储，核查设备、挂载与可用空间，严禁解压到内部 /overlay 或 /
+    log_info "正在预检全部恢复目标的挂载设备、安全与可用空间..."
     mkdir -p "$TARGET_DATA_ROOT"
-    check_mount_safety "$TARGET_DATA_ROOT" "目标 DataRoot 目录"
+    vol_need_kb=$(du -sk "$BACKUP_DIR/docker_volumes.tar.gz" 2>/dev/null | awk '{print $1}' || echo 0)
+    vol_need_kb=$((vol_need_kb * 2 + 10240))
+    check_mount_safety "$TARGET_DATA_ROOT" "目标 DataRoot 目录" "$vol_need_kb"
     TARGET_DATA_ABS=$(cd "$TARGET_DATA_ROOT" && pwd -P)
 
-    # 预检所有 Compose 项目的目标路径挂载安全性
+    # 预检所有 Compose 项目的目标路径挂载安全性与空间
     if [ -f "$COMPOSE_MANIFEST" ]; then
         while IFS='	' read -r proj_name orig_dir config_file || [ -n "$proj_name" ]; do
             [ -z "$proj_name" ] && continue
             dest_dir=$(resolve_bind_path "$orig_dir")
-            check_mount_safety "$dest_dir" "Compose 项目 [$proj_name] 目标目录 ($orig_dir)"
+            proj_tar="$BACKUP_DIR/compose/${proj_name}.tar.gz"
+            proj_need_kb=0
+            if [ -f "$proj_tar" ]; then
+                proj_need_kb=$(du -sk "$proj_tar" 2>/dev/null | awk '{print $1}' || echo 0)
+                proj_need_kb=$((proj_need_kb * 2 + 5120))
+            fi
+            check_mount_safety "$dest_dir" "Compose 项目 [$proj_name] 目标目录 ($orig_dir)" "$proj_need_kb"
         done < "$COMPOSE_MANIFEST"
     fi
 
-    # 预检所有 Bind Mounts 目标路径挂载安全性
+    # 预检所有 Bind Mounts 目标路径挂载安全性与空间
     if [ -f "$BIND_MANIFEST" ]; then
+        bind_need_kb=0
+        if [ -f "$BACKUP_DIR/docker_bind_mounts.tar.gz" ]; then
+            bind_need_kb=$(du -sk "$BACKUP_DIR/docker_bind_mounts.tar.gz" 2>/dev/null | awk '{print $1}' || echo 0)
+            bind_need_kb=$((bind_need_kb * 2 + 10240))
+        fi
         while IFS= read -r mpath || [ -n "$mpath" ]; do
             [ -z "$mpath" ] && continue
             actual_dest=$(resolve_bind_path "$mpath")
-            check_mount_safety "$actual_dest" "Bind Mount 恢复目标 ($mpath)"
+            check_mount_safety "$actual_dest" "Bind Mount 恢复目标 ($mpath)" "$bind_need_kb"
         done < "$BIND_MANIFEST"
     fi
 
@@ -1425,33 +1577,58 @@ do_verify_runtime() {
                             SOCKS_PORT=$(jq -r '.inbounds[]? | select((.protocol? == "socks") or (.type? == "socks") or ((.tag? // "") | test("socks"; "i"))) | (.listen_port // .port // empty)' "$cfg" 2>/dev/null | head -n 1 || true)
                         fi
                         if [ -z "$SOCKS_PORT" ]; then
-                            # 使用 awk 严格在 inbounds 节区内提取 socks 监听端口，杜绝截取 outbounds 远程服务器端口
+                            # 使用 awk 严格在 inbounds 节区内提取 socks 监听端口，杜绝截取 outbounds 远程服务器端口（支持嵌套对象与 port/protocol 任意出现顺序）
                             SOCKS_PORT=$(awk '
-                                BEGIN { in_inb=0; in_socks=0; depth=0; port="" }
-                                /"inbounds"[[:space:]]*:/ { in_inb=1 }
-                                in_inb && /\{/ { depth++ }
-                                in_inb && (/"protocol"[[:space:]]*:[[:space:]]*"socks"/ || /"type"[[:space:]]*:[[:space:]]*"socks"/ || /"tag"[[:space:]]*:[[:space:]]*"[^"]*socks[^"]*"/) { in_socks=1 }
-                                in_inb && in_socks && /"(listen_port|port)"[[:space:]]*:/ {
-                                    match($0, /"(listen_port|port)"[[:space:]]*:[[:space:]]*[0-9]+/)
-                                    if (RLENGTH > 0) {
-                                        str = substr($0, RSTART, RLENGTH)
-                                        split(str, arr, ":")
-                                        gsub(/[[:space:]]/, "", arr[2])
-                                        port = arr[2]
-                                        print port
-                                        exit
+                                BEGIN {
+                                    in_inb = 0
+                                    brace_depth = 0
+                                    curr_port = ""
+                                    is_socks = 0
+                                }
+                                /"inbounds"[[:space:]]*:/ {
+                                    in_inb = 1
+                                }
+                                in_inb {
+                                    n_open = split($0, d1, /\{/) - 1
+                                    n_close = split($0, d2, /\}/) - 1
+
+                                    if (brace_depth > 0 || n_open > 0) {
+                                        if ($0 ~ /"(protocol|type)"[[:space:]]*:[[:space:]]*"socks"/ || $0 ~ /"tag"[[:space:]]*:[[:space:]]*"[^"]*socks[^"]*"/) {
+                                            is_socks = 1
+                                        }
+                                        if ($0 ~ /"(listen_port|port)"[[:space:]]*:[[:space:]]*[0-9]+/) {
+                                            match($0, /"(listen_port|port)"[[:space:]]*:[[:space:]]*[0-9]+/)
+                                            if (RLENGTH > 0) {
+                                                str = substr($0, RSTART, RLENGTH)
+                                                split(str, arr, ":")
+                                                gsub(/[[:space:]]/, "", arr[2])
+                                                curr_port = arr[2]
+                                            }
+                                        }
+                                    }
+
+                                    if (brace_depth == 0 && n_open > 0) {
+                                        brace_depth += n_open
+                                        brace_depth -= n_close
+                                    } else if (brace_depth > 0) {
+                                        brace_depth += n_open
+                                        brace_depth -= n_close
+                                    }
+
+                                    if (brace_depth == 0 && (n_open > 0 || n_close > 0)) {
+                                        if (is_socks == 1 && curr_port != "") {
+                                            print curr_port
+                                            exit
+                                        }
+                                        curr_port = ""
+                                        is_socks = 0
+                                    }
+
+                                    if (brace_depth == 0 && $0 ~ /\]/) {
+                                        in_inb = 0
                                     }
                                 }
-                                in_inb && /\}/ {
-                                    if (in_socks) in_socks=0
-                                    depth--
-                                    if (depth <= 0) in_inb=0
-                                }
                             ' "$cfg" 2>/dev/null || true)
-                        fi
-                        if [ -z "$SOCKS_PORT" ]; then
-                            # 回退在 inbounds 边界内查找首个 listen_port 或 port (严格拦截 outbounds 以后)
-                            SOCKS_PORT=$(sed -n '/"inbounds"/,/"outbounds"/p' "$cfg" 2>/dev/null | grep -oE '"(listen_port|port)": *[0-9]+' | head -n 1 | awk '{print $2}' || true)
                         fi
                     fi
                 done
@@ -1523,9 +1700,12 @@ do_verify_runtime() {
         fi
 
         DMESG_TEXT=$(dmesg 2>/dev/null || true)
+        LOGREAD_TEXT=$(logread -e ppe 2>/dev/null || logread 2>/dev/null || true)
+        ALL_KERNEL_LOG="$DMESG_TEXT $LOGREAD_TEXT"
+
         PPE_DRIVER_FAIL=0
-        if echo "$DMESG_TEXT" | grep -qiE "(ppe|flowtable|qcom-ppe).*(fail|error|disabled|cannot|timed out)"; then
-            log_error "dmesg 检测到 PPE/Flowtable 驱动报错或探测失败 (probe failed)，硬件加速未正常生效！"
+        if echo "$ALL_KERNEL_LOG" | grep -qiE "(ppe|flowtable|qcom-ppe).*(probe.*fail|fail|error|disabled|cannot|timed out)"; then
+            log_error "内核/系统日志检测到 PPE/Flowtable 驱动报错或探测失败 (probe failed)，硬件加速未正常生效！"
             PPE_DRIVER_FAIL=1
         fi
 
