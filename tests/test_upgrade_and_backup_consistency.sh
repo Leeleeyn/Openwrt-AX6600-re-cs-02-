@@ -26,10 +26,17 @@ REQUIRED_SECTIONS=(
     "firewall.qcanssecm"
     "flowtable"
     "socks5-hostname"
+    "mysqldump"
+    "pg_dumpall"
+    "redis-cli"
+    "iptables-nft"
+    "DISTRIB_DESCRIPTION"
+    "extroot"
+    "FORWARD"
 )
 
 for SEC in "${REQUIRED_SECTIONS[@]}"; do
-    if ! grep -q "$SEC" "$GUIDE_FILE"; then
+    if ! grep -qiE "$SEC" "$GUIDE_FILE"; then
         echo "FAIL: Required section/keyword '$SEC' not found in $GUIDE_FILE!" >&2
         exit 1
     fi
@@ -97,6 +104,9 @@ case "$CMD" in
             if grep -q "config include 'qcanssecm'" "$CONFIG_FILE"; then
                 echo "include"
                 exit 0
+            elif grep -q "config rule 'qcanssecm'" "$CONFIG_FILE"; then
+                echo "rule"
+                exit 0
             fi
             exit 1
         fi
@@ -139,6 +149,7 @@ chmod +x "$TMP_DIR/uci"
             case "$SCRIPT_PATH" in
                 /etc/firewall.d/qca-nss-ecm|/etc/firewall.d/qca-nss|/etc/firewall.nss)
                     echo "Found legacy NSS include firewall.qcanssecm, deleting..."
+                    cp "$MOCK_CONFIG" "$MOCK_CONFIG.bak"
                     uci delete firewall.qcanssecm
                     uci commit firewall
                     ;;
@@ -150,6 +161,11 @@ chmod +x "$TMP_DIR/uci"
 # Verify results: qcanssecm should be gone, user rules must remain untouched
 if grep -q "config include 'qcanssecm'" "$MOCK_CONFIG"; then
     echo "FAIL: firewall.qcanssecm was not deleted!" >&2
+    exit 1
+fi
+
+if [ ! -f "$MOCK_CONFIG.bak" ]; then
+    echo "FAIL: firewall backup file was not created before cleanup!" >&2
     exit 1
 fi
 
@@ -191,7 +207,7 @@ if ! grep -q "config rule 'qcanssecm'" "$MOCK_CONFIG"; then
     echo "FAIL: rule with same name 'qcanssecm' was mistakenly deleted!" >&2
     exit 1
 fi
-echo "PASS: NSS cleanup successfully removed only the legacy include and preserved all user rules."
+echo "PASS: NSS cleanup successfully removed only the legacy include, created backup, and preserved all user rules."
 
 # Test 4: Helper script executable test
 echo "--- Test 4: Verify docker_upgrade_helper.sh is valid ---"

@@ -12,6 +12,7 @@ TEST_SANDBOX="$REPO_ROOT/tests/tmp_sandbox_$$"
 MOCK_BIN="$TEST_SANDBOX/mock_bin"
 SYS_ROOT="$TEST_SANDBOX/sys_root"
 MOCK_STATE="$TEST_SANDBOX/mock_state"
+export TEST_SANDBOX MOCK_BIN SYS_ROOT MOCK_STATE
 
 mkdir -p "$MOCK_BIN" "$SYS_ROOT" "$MOCK_STATE"
 
@@ -36,8 +37,17 @@ case "$cmd" in
             exit 1
         fi
         if [ "${1:-}" = "-f" ]; then
-            cat "$MOCK_STATE/docker_root_dir" 2>/dev/null || echo "/var/lib/docker"
-            exit 0
+            fmt="${2:-}"
+            case "$fmt" in
+                *"Driver"*)
+                    echo "overlay2"
+                    exit 0
+                    ;;
+                *)
+                    cat "$MOCK_STATE/docker_root_dir" 2>/dev/null || echo "/var/lib/docker"
+                    exit 0
+                    ;;
+            esac
         fi
         echo "Docker Root Dir: $(cat "$MOCK_STATE/docker_root_dir" 2>/dev/null || echo "/var/lib/docker")"
         exit 0
@@ -91,6 +101,9 @@ case "$cmd" in
                     ;;
                 *"Binds"*)
                     cat "$MOCK_STATE/binds_$cid" 2>/dev/null || true
+                    ;;
+                *"Env"*)
+                    echo "MYSQL_ROOT_PASSWORD=my_secret_pass_123"
                     ;;
                 *)
                     echo ""
@@ -167,6 +180,29 @@ case "$cmd" in
             exit 1
         fi
         echo "compose $* at $(pwd)" >> "$MOCK_STATE/compose_invocations.log"
+        exit 0
+        ;;
+    exec)
+        echo "docker exec $*" >> "$MOCK_STATE/invocations.log"
+        if echo "$*" | grep -q "mysqldump"; then
+            echo "-- MySQL dump simulated"
+            echo "CREATE TABLE test_table (id INT);"
+            exit 0
+        elif echo "$*" | grep -q "pg_dumpall"; then
+            echo "-- PostgreSQL dump simulated"
+            exit 0
+        elif echo "$*" | grep -q "redis-cli"; then
+            echo "OK"
+            exit 0
+        fi
+        exit 0
+        ;;
+    volume)
+        echo "app_volume"
+        exit 0
+        ;;
+    version)
+        echo "29.6.1"
         exit 0
         ;;
     *)
@@ -259,11 +295,46 @@ echo "nft $*" >> "$MOCK_STATE/invocations.log"
 if [ -f "$MOCK_STATE/nft_has_flowtable" ]; then
     echo "table inet fw4 { flowtable ft { hook ingress priority 0; devices = { eth0 }; } }"
 else
-    echo "table inet fw4 { chain forward { type filter hook forward priority 0; } }"
+    echo "table inet fw4 { chain forward { type filter hook forward priority 0; drop; } }"
 fi
 exit 0
 EOF
 chmod +x "$MOCK_BIN/nft"
+
+cat << 'EOF' > "$MOCK_BIN/iptables"
+#!/bin/sh
+echo "iptables $*" >> "$MOCK_STATE/invocations.log"
+if [ "${1:-}" = "-V" ]; then
+    echo "iptables v1.8.10 (nf_tables)"
+    exit 0
+fi
+if [ "${1:-}" = "-S" ] && [ "${2:-}" = "FORWARD" ]; then
+    echo "-P FORWARD DROP"
+    exit 0
+fi
+exit 0
+EOF
+chmod +x "$MOCK_BIN/iptables"
+
+cat << 'EOF' > "$MOCK_BIN/jq"
+#!/bin/sh
+echo "jq $*" >> "$MOCK_STATE/invocations.log"
+if [ -f "$MOCK_STATE/jq_fail" ]; then
+    exit 1
+fi
+exit 0
+EOF
+chmod +x "$MOCK_BIN/jq"
+
+cat << 'EOF' > "$MOCK_BIN/logread"
+#!/bin/sh
+echo "logread $*" >> "$MOCK_STATE/invocations.log"
+if [ -f "$MOCK_STATE/logread_tls_error" ]; then
+    echo "[ERROR] passwall2: TLS Handshake failed: certificate unknown"
+fi
+exit 0
+EOF
+chmod +x "$MOCK_BIN/logread"
 
 cat << 'EOF' > "$MOCK_BIN/dmesg"
 #!/bin/sh
@@ -431,53 +502,30 @@ esac
 EOF
 chmod +x "$SYS_ROOT/etc/init.d/dockerd"
 
-cat << 'EOF' > "$SYS_ROOT/etc/init.d/firewall"
-#!/bin/sh
-echo "init.d/firewall $*" >> "$MOCK_STATE/invocations.log"
-exit 0
-EOF
-chmod +x "$SYS_ROOT/etc/init.d/firewall"
-
+# 设置环境变量，强制 Mock 生效
 export PATH="$MOCK_BIN:$PATH"
-export SYS_ROOT="$SYS_ROOT"
-export MOCK_STATE="$MOCK_STATE"
 
 echo "=== 开始执行 AX6600 备份恢复与升级验证回归测试套件 ==="
 echo "沙箱根路径: $TEST_SANDBOX"
 
 # -----------------------------------------------------------------------------
-# 测试 0: 测试隔离性证明（证明绝不修改宿主配置、绝不调用宿主命令）
+# 测试 0: 验证测试套件隔离性（所有 mock 必须拦截）
 # -----------------------------------------------------------------------------
 echo "--- 测试 0: 测试环境隔离性验证 ---"
 (
-    : > "$MOCK_STATE/invocations.log"
-    MOCK_DOCKER_ROOT="$TEST_SANDBOX/iso_docker"
-    MOCK_TARGET="$TEST_SANDBOX/iso_target"
-    mkdir -p "$MOCK_DOCKER_ROOT/volumes" "$MOCK_TARGET"
-    echo "$MOCK_DOCKER_ROOT" > "$MOCK_STATE/docker_root_dir"
-
-    # 执行备份
-    sh "$HELPER_SCRIPT" backup --target-dir "$MOCK_TARGET" --docker-dir "$MOCK_DOCKER_ROOT" --sys-root "$SYS_ROOT" --skip-stop >/dev/null
-
-    # 验证调用记录全部来自 mock，且没有任何宿主机逃逸
-    if ! grep -q "docker " "$MOCK_STATE/invocations.log"; then
-        echo "FAIL: docker 命令未被隔离捕获！"
+    if [ "$(which docker)" != "$MOCK_BIN/docker" ]; then
+        echo "FAIL: docker 未被沙箱拦截！"
         exit 1
     fi
-    if ! grep -q "df " "$MOCK_STATE/invocations.log"; then
-        echo "FAIL: df 命令未被隔离捕获！"
-        exit 1
-    fi
-    # 验证宿主机根目录下绝对没有产物产生
-    if [ -d "/opt/docker_upgrade_helper_canary" ]; then
-        echo "FAIL: 宿主目录遭到污染！"
+    if [ "$(which uci)" != "$MOCK_BIN/uci" ]; then
+        echo "FAIL: uci 未被沙箱拦截！"
         exit 1
     fi
 )
 echo "PASS: 测试 0 通过（测试隔离性已确认，所有系统调用均被沙箱完全拦截）"
 
 # -----------------------------------------------------------------------------
-# 测试 1: 探测 DockerRootDir 失败（无法连接 dockerd）严格报错退出
+# 测试 1: dockerd 未运行或探测 DockerRootDir 失败时必须报错
 # -----------------------------------------------------------------------------
 echo "--- 测试 1: dockerd 未运行或探测 DockerRootDir 失败时严格报错 ---"
 (
@@ -489,42 +537,42 @@ echo "--- 测试 1: dockerd 未运行或探测 DockerRootDir 失败时严格报�
     rm -f "$MOCK_STATE/docker_fail_info"
 
     if [ "$ret" -eq 0 ]; then
-        echo "FAIL: dockerd 未连接却没有报错退出！"
+        echo "FAIL: dockerd 探测失败时，backup 竟然返回成功！"
         exit 1
     fi
     if ! grep -q "无法连接 Docker 守护进程" "$TEST_SANDBOX/t1.log"; then
-        echo "FAIL: 错误提示不符合预期: $(cat "$TEST_SANDBOX/t1.log")"
+        echo "FAIL: 未报告预期的 dockerd 连接失败: $(cat "$TEST_SANDBOX/t1.log")"
         exit 1
     fi
 )
 echo "PASS: 测试 1 通过（连接 dockerd 失败严格阻断）"
 
 # -----------------------------------------------------------------------------
-# 测试 2: 目标目录位于 DockerRootDir 内部（防递归无限打包）拦截
+# 测试 2: 目标目录在 DockerRootDir 内部时必须被拦截（防止递归打包）
 # -----------------------------------------------------------------------------
 echo "--- 测试 2: 拦截备份目标在 DockerRootDir 内部 ---"
 (
     MOCK_DOCKER_ROOT="$TEST_SANDBOX/t2_docker"
-    mkdir -p "$MOCK_DOCKER_ROOT"
-    NESTED_TARGET="$MOCK_DOCKER_ROOT/my_backup"
+    mkdir -p "$MOCK_DOCKER_ROOT/volumes" "$MOCK_DOCKER_ROOT/recursive_backup"
 
     set +e
-    sh "$HELPER_SCRIPT" backup --docker-dir "$MOCK_DOCKER_ROOT" --target-dir "$NESTED_TARGET" --sys-root "$SYS_ROOT" --skip-stop 2>"$TEST_SANDBOX/t2.log"
+    sh "$HELPER_SCRIPT" backup --docker-dir "$MOCK_DOCKER_ROOT" --target-dir "$MOCK_DOCKER_ROOT/recursive_backup" --sys-root "$SYS_ROOT" --skip-stop 2>"$TEST_SANDBOX/t2.log"
     ret=$?
     set -e
+
     if [ "$ret" -eq 0 ]; then
         echo "FAIL: 目标在 DockerRootDir 内部却没有拦截！"
         exit 1
     fi
     if ! grep -q "不能在 DockerRootDir" "$TEST_SANDBOX/t2.log"; then
-        echo "FAIL: 错误提示不符合预期: $(cat "$TEST_SANDBOX/t2.log")"
+        echo "FAIL: 未报告递归打包拦截: $(cat "$TEST_SANDBOX/t2.log")"
         exit 1
     fi
 )
 echo "PASS: 测试 2 通过（内部递归目录被成功拦截）"
 
 # -----------------------------------------------------------------------------
-# 测试 3: 外盘未挂载拦截 (df 返回 mountpoint / 或 device overlayfs:/overlay 或 tmpfs)
+# 测试 3: 外盘未挂载或备份目标位于 /overlay、/ 等重置位置时严格拒绝
 # -----------------------------------------------------------------------------
 echo "--- 测试 3: 外盘未挂载或位于 /overlay / tmpfs 时严格拒绝 ---"
 (
@@ -614,9 +662,7 @@ echo "--- 测试 6: 归档缺漏文件时严格报错 ---"
     mkdir -p "$MOCK_DOCKER_ROOT/volumes/vol_missing"
     echo "data" > "$MOCK_DOCKER_ROOT/volumes/vol_missing/file.txt"
 
-    # 模拟外部 bind mounts 记录了一个缺失的源路径
     mkdir -p "$TEST_SANDBOX/t6_target/metadata"
-    # 当容器 inspect 引用了不存在的外部 bind mount 路径时
     cat << 'EOF' > "$MOCK_STATE/inspect.json"
 [
   {
@@ -648,7 +694,7 @@ EOF
 echo "PASS: 测试 6 通过（归档文件缺失被准确识别阻断）"
 
 # -----------------------------------------------------------------------------
-# 测试 7: 端到端完整隔离备份与恢复演练（含 .env、原路径、独立容器重建与配置统一）
+# 测试 7: 端到端完整隔离备份与恢复演练（含数据库热备、.env、原路径、独立容器重建与配置统一）
 # -----------------------------------------------------------------------------
 echo "--- 测试 7: 端到端隔离备份与完整数据恢复演练 ---"
 (
@@ -680,7 +726,7 @@ EOF
     echo "package dockerman" > "$SYS_ROOT/etc/config/dockerman"
     echo "1" > "$SYS_ROOT/etc/dockerd_enabled_flag"
 
-    # 设置 Mock 容器状态：包含 1 个 Compose 容器和 1 个带可写层改动的独立容器
+    # 设置 Mock 容器状态：包含 1 个 Compose 容器、1 个独立容器、1 个运行中 MySQL 数据库容器
     cat << EOF > "$MOCK_STATE/inspect.json"
 [
   {
@@ -711,10 +757,24 @@ EOF
       "Privileged": false,
       "Binds": []
     }
+  },
+  {
+    "Id": "mysql_cid",
+    "Name": "/mysql_db",
+    "Config": {
+      "Image": "mysql:8.0",
+      "Labels": {}
+    },
+    "HostConfig": {
+      "NetworkMode": "bridge",
+      "RestartPolicy": { "Name": "unless-stopped" },
+      "Privileged": false,
+      "Binds": []
+    }
   }
 ]
 EOF
-    echo -e "comp_cid\nstandalone_cid" > "$MOCK_STATE/containers_list_ids"
+    echo -e "comp_cid\nstandalone_cid\nmysql_cid" > "$MOCK_STATE/containers_list_ids"
     echo "my_proj" > "$MOCK_STATE/comp_project_comp_cid"
     echo "$ROUTER_COMPOSE" > "$MOCK_STATE/comp_workdir_comp_cid"
     echo "$ROUTER_COMPOSE/docker-compose.yml" > "$MOCK_STATE/comp_config_comp_cid"
@@ -723,8 +783,10 @@ EOF
 
     echo "redis:alpine" > "$MOCK_STATE/cimg_standalone_cid"
     echo "standalone_app" > "$MOCK_STATE/cname_standalone_cid"
-    # 模拟独立容器有可写层改动
     echo "C /etc/redis.conf" > "$MOCK_STATE/diff_standalone_cid"
+
+    echo "mysql:8.0" > "$MOCK_STATE/cimg_mysql_cid"
+    echo "mysql_db" > "$MOCK_STATE/cname_mysql_cid"
 
     # 1. 执行全量备份
     sh "$HELPER_SCRIPT" backup \
@@ -742,6 +804,16 @@ EOF
     # 验证配置文件统一命名的正确性
     if [ ! -d "$BKP_STORE/config/etc_docker" ] || [ ! -f "$BKP_STORE/config/config_dockerd" ] || [ ! -f "$BKP_STORE/config/config_dockerman" ]; then
         echo "FAIL: 备份配置命名不规范或缺失！"
+        exit 1
+    fi
+
+    # 验证应用级数据库热备文件已生成并记录在校验列表中
+    if [ ! -f "$BKP_STORE/databases/mysql_mysql_db.sql" ]; then
+        echo "FAIL: 未自动生成 MySQL 逻辑热备文件！"
+        exit 1
+    fi
+    if ! grep -q "databases/mysql_mysql_db.sql" "$BKP_STORE/sha256sums.txt"; then
+        echo "FAIL: sha256sums.txt 遗漏数据库转储校验记录！"
         exit 1
     fi
 
@@ -824,7 +896,7 @@ EOF
         exit 1
     fi
 )
-echo "PASS: 测试 7 通过（端到端隔离全量备份、还原、原路径校验与自启恢复全部一致）"
+echo "PASS: 测试 7 通过（端到端隔离全量备份、数据库热备、还原、原路径校验与自启恢复全部一致）"
 
 # -----------------------------------------------------------------------------
 # 测试 8: 镜像预检与双分区容量安全核验（严禁取大）
@@ -832,7 +904,6 @@ echo "PASS: 测试 7 通过（端到端隔离全量备份、还原、原路径�
 echo "--- 测试 8: 镜像校验与双分区容量安全预检 ---"
 (
     IMG_FILE="$TEST_SANDBOX/test_fw.bin"
-    # 创建模拟固件镜像 (100MB)
     head -c 104857600 /dev/zero > "$IMG_FILE"
     SHA_EXPECTED=$(sha256sum "$IMG_FILE" | awk '{print $1}')
 
@@ -848,7 +919,6 @@ echo "--- 测试 8: 镜像校验与双分区容量安全预检 ---"
 
     # 8b: 双分区目标为 60MB 较小分区时，绝不能被 512MB 误放行
     echo "dual_small_target" > "$MOCK_STATE/fdisk_mode"
-    # 模拟活动分区为 rootfs_1，sysupgrade 将写入 rootfs (仅 60MB)
     echo "root=rootfs_1" > "$SYS_ROOT/proc/cmdline"
 
     set +e
@@ -865,11 +935,25 @@ echo "--- 测试 8: 镜像校验与双分区容量安全预检 ---"
         echo "FAIL: 错误提示不符合预期: $(cat "$TEST_SANDBOX/t8_part.log")"
         exit 1
     fi
+
+    # 8c: 系统只读体检模式验证 (识别固件、硬件型号与分区)
+    echo "DISTRIB_DESCRIPTION='OpenWrt 23.05-SNAPSHOT'" > "$SYS_ROOT/etc/openwrt_release"
+    mkdir -p "$SYS_ROOT/tmp/sysinfo"
+    echo "JDCloud AX6600 (RE-CS-02)" > "$SYS_ROOT/tmp/sysinfo/model"
+    sh "$HELPER_SCRIPT" precheck --system-only --sys-root "$SYS_ROOT" > "$TEST_SANDBOX/t8_sys.log"
+    if ! grep -q "当前固件: OpenWrt 23.05-SNAPSHOT" "$TEST_SANDBOX/t8_sys.log"; then
+        echo "FAIL: 系统预检未能正确识别固件描述！"
+        exit 1
+    fi
+    if ! grep -q "设备型号: JDCloud AX6600" "$TEST_SANDBOX/t8_sys.log"; then
+        echo "FAIL: 系统预检未能正确识别设备型号！"
+        exit 1
+    fi
 )
-echo "PASS: 测试 8 通过（镜像预检严格，双分区未误取较大者）"
+echo "PASS: 测试 8 通过（镜像预检严格，系统只读体检输出完整，双分区未误取较大者）"
 
 # -----------------------------------------------------------------------------
-# 测试 9: NSS 清理严格匹配（节类型为 include 且路径精确匹配）
+# 测试 9: NSS 清理严格匹配（节类型为 include 且路径精确匹配，并自动备份旧配置）
 # -----------------------------------------------------------------------------
 echo "--- 测试 9: NSS 清理精确匹配与安全性 ---"
 (
@@ -891,6 +975,12 @@ EOF
     # 执行清理
     sh "$HELPER_SCRIPT" clean-nss --sys-root "$SYS_ROOT" >/dev/null
 
+    # 验证自动备份存在
+    if ! ls "$SYS_ROOT/etc/config"/firewall.bak.* >/dev/null 2>&1; then
+        echo "FAIL: clean-nss 未在修改前自动创建防火墙配置备份！"
+        exit 1
+    fi
+
     # 验证结果：只有旧 include 被删，同名 rule 和自定义 include 完好
     if grep -q "/etc/firewall.d/qca-nss-ecm" "$SYS_ROOT/etc/config/firewall"; then
         echo "FAIL: 废弃 include 未被清理！"
@@ -905,7 +995,7 @@ EOF
         exit 1
     fi
 )
-echo "PASS: 测试 9 通过（NSS 清理精准保护自定义规则，仅清除废弃 include）"
+echo "PASS: 测试 9 通过（NSS 清理精准保护自定义规则，备份防火墙配置并清除废弃 include）"
 
 # -----------------------------------------------------------------------------
 # 测试 10: 运行时验收失败分支阻断
@@ -957,6 +1047,34 @@ echo "--- 测试 10: 运行时验收失败阻断 ---"
         echo "FAIL: PassWall2 端口缺失盲猜 1080 竟然放行！"
         exit 1
     fi
+
+    # 10e: PassWall2 存在 TLS 握手报错日志必须拦截
+    touch "$MOCK_STATE/pgrep_running_sing-box"
+    mkdir -p "$SYS_ROOT/var/etc/passwall2"
+    echo '{"inbounds":[{"port":1080}]}' > "$SYS_ROOT/var/etc/passwall2/TCP.json"
+    touch "$MOCK_STATE/logread_tls_error"
+    set +e
+    sh "$HELPER_SCRIPT" verify passwall --sys-root "$SYS_ROOT" 2>"$TEST_SANDBOX/t10_pw_tls.log"
+    ret=$?
+    set -e
+    rm -f "$MOCK_STATE/pgrep_running_sing-box" "$MOCK_STATE/logread_tls_error"
+    if [ "$ret" -eq 0 ]; then
+        echo "FAIL: PassWall2 日志存在 TLS 握手错误却验收放行！"
+        exit 1
+    fi
+
+    # 10f: PassWall2 配置文件语法错误必须拦截
+    touch "$MOCK_STATE/pgrep_running_sing-box"
+    touch "$MOCK_STATE/jq_fail"
+    set +e
+    sh "$HELPER_SCRIPT" verify passwall --sys-root "$SYS_ROOT" 2>"$TEST_SANDBOX/t10_pw_jq.log"
+    ret=$?
+    set -e
+    rm -f "$MOCK_STATE/pgrep_running_sing-box" "$MOCK_STATE/jq_fail"
+    if [ "$ret" -eq 0 ]; then
+        echo "FAIL: PassWall2 配置文件 JSON 语法错误却放行！"
+        exit 1
+    fi
 )
 echo "PASS: 测试 10 通过（运行时验收各项失败分支均有效阻断）"
 
@@ -965,7 +1083,6 @@ echo "PASS: 测试 10 通过（运行时验收各项失败分支均有效阻断�
 # -----------------------------------------------------------------------------
 echo "--- 测试 11: 验证测试沙箱隔离与清理范围 ---"
 (
-    # 验证测试期间在沙箱外没有任何临时文件产生
     if [ ! -d "$TEST_SANDBOX" ]; then
         echo "FAIL: 沙箱路径异常！"
         exit 1

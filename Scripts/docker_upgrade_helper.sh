@@ -108,7 +108,212 @@ check_space_safety() {
 }
 
 # -----------------------------------------------------------------------------
-# 1. 备份子命令 (backup)
+# 1. 升级前系统只读体检与双分区容量预检 (precheck)
+# -----------------------------------------------------------------------------
+do_precheck() {
+    IMAGE_PATH=""
+    EXPECTED_SHA=""
+    SYSTEM_ONLY=0
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --image)
+                IMAGE_PATH="$2"
+                shift 2
+                ;;
+            --sha256)
+                EXPECTED_SHA="$2"
+                shift 2
+                ;;
+            --system-only)
+                SYSTEM_ONLY=1
+                shift
+                ;;
+            --sys-root)
+                SYS_ROOT="$2"
+                shift 2
+                ;;
+            -*)
+                log_error "未知预检参数: $1"
+                exit 1
+                ;;
+            *)
+                if [ -z "$IMAGE_PATH" ]; then
+                    IMAGE_PATH="$1"
+                elif [ -z "$EXPECTED_SHA" ]; then
+                    EXPECTED_SHA="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    log_info "=== AX6600 升级前只读健康体检 ==="
+
+    # 1. 当前固件版本与硬件型号
+    RELEASE_FILE="$(get_sys_path /etc/openwrt_release)"
+    MODEL_FILE="$(get_sys_path /tmp/sysinfo/model)"
+    DT_MODEL="$(get_sys_path /proc/device-tree/model)"
+
+    FW_DESC="未知"
+    if [ -f "$RELEASE_FILE" ]; then
+        FW_DESC=$(grep "DISTRIB_DESCRIPTION" "$RELEASE_FILE" | head -n 1 | cut -d= -f2- | tr -d '"'\''' || true)
+    fi
+
+    HW_MODEL="未知"
+    if [ -f "$MODEL_FILE" ]; then
+        HW_MODEL=$(cat "$MODEL_FILE" 2>/dev/null || true)
+    elif [ -f "$DT_MODEL" ]; then
+        HW_MODEL=$(cat "$DT_MODEL" 2>/dev/null || true)
+    fi
+    log_info "当前固件: ${FW_DESC:-OpenWrt} | 设备型号: ${HW_MODEL:-JDCloud AX6600 (RE-CS-02)}"
+
+    # 2. 检查 eMMC 分区与对侧待升级目标分区
+    MMC_DEV="/dev/mmcblk0"
+    PROC_CMDLINE="$(get_sys_path /proc/cmdline)"
+
+    require_cmd fdisk
+    FDISK_OUT=$(fdisk -l "$MMC_DEV" 2>/dev/null || true)
+    if [ -z "$FDISK_OUT" ]; then
+        log_error "无法读取 eMMC 分区表信息 ($MMC_DEV)，禁止盲刷！"
+        exit 1
+    fi
+
+    ACTIVE_ROOT=""
+    if [ -f "$PROC_CMDLINE" ]; then
+        ACTIVE_ROOT=$(grep -o 'root=[^ ]*' "$PROC_CMDLINE" | head -n 1 | cut -d= -f2 || true)
+    fi
+
+    ROOTFS_SEC=$(echo "$FDISK_OUT" | grep -E "[[:space:]]rootfs[[:space:]]*$" | awk '{print $4}' || true)
+    ROOTFS1_SEC=$(echo "$FDISK_OUT" | grep -E "[[:space:]]rootfs_1[[:space:]]*$" | awk '{print $4}' || true)
+
+    if [ -z "$ROOTFS_SEC" ] && [ -z "$ROOTFS1_SEC" ]; then
+        ROOTFS_SEC=$(echo "$FDISK_OUT" | grep -w "rootfs" | awk '{print $4}' | head -n 1 || true)
+        ROOTFS1_SEC=$(echo "$FDISK_OUT" | grep -w "rootfs_1" | awk '{print $4}' | head -n 1 || true)
+    fi
+
+    if [ -z "$ROOTFS_SEC" ] && [ -z "$ROOTFS1_SEC" ]; then
+        log_error "未能在分区表中找到 rootfs/rootfs_1 分区信息，目标分区不明，禁止放行！"
+        exit 1
+    fi
+
+    TARGET_SEC=""
+    TARGET_PART=""
+    if [ -n "$ACTIVE_ROOT" ]; then
+        case "$ACTIVE_ROOT" in
+            *rootfs_1*)
+                TARGET_PART="rootfs (对侧待升级目标)"
+                TARGET_SEC="$ROOTFS_SEC"
+                ;;
+            *rootfs*)
+                TARGET_PART="rootfs_1 (对侧待升级目标)"
+                TARGET_SEC="$ROOTFS1_SEC"
+                ;;
+        esac
+    fi
+
+    # 若无法确定当前启动分区，取候选分区中较小者（严禁取大），确保安全边际
+    if [ -z "$TARGET_SEC" ]; then
+        if [ -n "$ROOTFS_SEC" ] && [ -n "$ROOTFS1_SEC" ]; then
+            if [ "$ROOTFS_SEC" -le "$ROOTFS1_SEC" ]; then
+                TARGET_SEC="$ROOTFS_SEC"
+                TARGET_PART="rootfs (较小分区)"
+            else
+                TARGET_SEC="$ROOTFS1_SEC"
+                TARGET_PART="rootfs_1 (较小分区)"
+            fi
+        elif [ -n "$ROOTFS_SEC" ]; then
+            TARGET_SEC="$ROOTFS_SEC"
+            TARGET_PART="rootfs"
+        else
+            TARGET_SEC="$ROOTFS1_SEC"
+            TARGET_PART="rootfs_1"
+        fi
+    fi
+
+    TARGET_BYTES=$((TARGET_SEC * 512))
+    TARGET_MB=$((TARGET_BYTES / 1024 / 1024))
+    log_info "当前启动分区: ${ACTIVE_ROOT:-未知} | 待升级目标分区: [$TARGET_PART] 扇区数: $TARGET_SEC (容量: ${TARGET_MB}MB)"
+
+    # 3. Docker 运行状态、存储驱动、DockerRootDir 与存储介质分类
+    if command -v docker >/dev/null 2>&1; then
+        DK_VER=$(docker version --format '{{.Server.Version}}' 2>/dev/null || docker --version 2>/dev/null || echo "未知")
+        DK_ROOT=$(docker info -f '{{.DockerRootDir}}' 2>/dev/null || echo "")
+        DK_DRIVER=$(docker info -f '{{.Driver}}' 2>/dev/null || echo "")
+        log_info "Docker 状态: 已安装 (版本: $DK_VER, 存储驱动: $DK_DRIVER)"
+
+        if [ -n "$DK_ROOT" ] && [ -d "$DK_ROOT" ]; then
+            log_info "DockerRootDir: $DK_ROOT"
+            DF_DK=$(df -P "$DK_ROOT" 2>/dev/null || true)
+            DK_DEV=$(echo "$DF_DK" | awk 'NR==2{print $1}')
+            DK_MNT=$(echo "$DF_DK" | awk 'NR==2{print $6}')
+            case "$DK_DEV" in
+                *mmcblk0p*|*overlay*|rootfs)
+                    if [ "$DK_MNT" = "/" ] || [ "$DK_MNT" = "/overlay" ]; then
+                        log_warn "⚠️ [高危存储分类] Docker 数据位于内部 eMMC Overlay ($DK_DEV 挂载于 $DK_MNT)！"
+                        log_warn "⚠️ sysupgrade 保留配置升级时将格式化/重置内部 Flash overlay，Docker 镜像与容器数据将被清空！必须完整导出至外部介质或 PC！"
+                    fi
+                    ;;
+                /dev/sd*|/dev/nvme*)
+                    if [ "$DK_MNT" = "/overlay" ]; then
+                        log_info "[存储分类] Docker 数据位于 Extroot 外置存储 ($DK_DEV 挂载于 /overlay)"
+                    else
+                        log_info "[存储分类] Docker 数据位于独立外部挂载介质 ($DK_DEV 挂载于 $DK_MNT, 推荐架构)"
+                    fi
+                    ;;
+                *)
+                    log_info "[存储分类] Docker 存储设备: $DK_DEV (挂载点: $DK_MNT)"
+                    ;;
+            esac
+
+            VOL_CNT=$(docker volume ls -q 2>/dev/null | wc -l || echo 0)
+            log_info "当前注册 Named Volumes 数量: $VOL_CNT"
+        fi
+    else
+        log_info "Docker 状态: 未运行或命令不可用"
+    fi
+
+    # 4. 若指定固件镜像，进行镜像文件校验与容量安全核验
+    if [ -n "$IMAGE_PATH" ]; then
+        if [ ! -f "$IMAGE_PATH" ]; then
+            log_error "固件文件不存在或匹配不唯一: $IMAGE_PATH"
+            exit 1
+        fi
+
+        IMG_SIZE=$(wc -c < "$IMAGE_PATH")
+        IMG_SIZE_MB=$((IMG_SIZE / 1024 / 1024))
+        log_info "固件文件确认: $IMAGE_PATH (大小: ${IMG_SIZE_MB}MB, ${IMG_SIZE} 字节)"
+
+        if [ -n "$EXPECTED_SHA" ]; then
+            require_cmd sha256sum
+            ACTUAL_SHA=$(sha256sum "$IMAGE_PATH" | awk '{print $1}')
+            if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+                log_error "固件 SHA256 校验不匹配！预期: $EXPECTED_SHA，实际: $ACTUAL_SHA"
+                exit 1
+            fi
+            log_info "固件 SHA256 校验通过: $ACTUAL_SHA"
+        fi
+
+        require_cmd sysupgrade
+        log_info "执行 sysupgrade -T 格式与机型兼容性预检..."
+        if ! sysupgrade -T "$IMAGE_PATH"; then
+            log_error "固件与当前硬件平台不兼容，禁止刷入！"
+            exit 1
+        fi
+        log_info "固件平台兼容性校验通过"
+
+        MIN_REQUIRED_BYTES=$((IMG_SIZE + 52428800))
+        MIN_REQUIRED_MB=$((MIN_REQUIRED_BYTES / 1024 / 1024))
+        if [ "$TARGET_BYTES" -le "$MIN_REQUIRED_BYTES" ]; then
+            log_error "目标分区容量 (${TARGET_MB}MB) 不足！刷入 ${IMG_SIZE_MB}MB 固件需至少 ${MIN_REQUIRED_MB}MB 空间以保留充足 overlay！"
+            exit 1
+        fi
+        log_info "目标分区容量安全校验通过 (${TARGET_MB}MB > ${MIN_REQUIRED_MB}MB)"
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# 2. 备份子命令 (backup)
 # -----------------------------------------------------------------------------
 do_backup() {
     TARGET_DIR=""
@@ -199,6 +404,9 @@ do_backup() {
     mkdir -p "$COMPOSE_STORE"
     STANDALONE_STORE="$TARGET_ABS/standalone"
     mkdir -p "$STANDALONE_STORE"
+    DB_STORE="$TARGET_ABS/databases"
+    mkdir -p "$DB_STORE"
+
     COMPOSE_MANIFEST="$META_DIR/compose_manifest.tsv"
     : > "$COMPOSE_MANIFEST"
     STANDALONE_MANIFEST="$META_DIR/standalone_manifest.txt"
@@ -209,7 +417,7 @@ do_backup() {
     # 空间估算基准值（20MB 冗余）
     TOTAL_NEED_KB=20480
 
-    # 3. 守护进程运行期间导出清单、网络与配置
+    # 3. 守护进程运行期间导出清单、网络与配置，并执行数据库应用级一致性导出
     if command -v docker >/dev/null 2>&1; then
         log_info "正在导出容器列表与元数据..."
         if ! docker ps -a --format '{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}' > "$META_DIR/containers_list.txt" 2>/dev/null; then
@@ -218,6 +426,8 @@ do_backup() {
         fi
 
         C_IDS=$(docker ps -aq 2>/dev/null || true)
+        RUNNING_IDS=$(docker ps -q 2>/dev/null || true)
+
         if [ -n "$C_IDS" ]; then
             if ! docker inspect $C_IDS > "$META_DIR/containers_inspect.json" 2>/dev/null; then
                 log_error "导出容器 inspect 信息失败！"
@@ -232,7 +442,58 @@ do_backup() {
             exit 1
         fi
 
-        # 处理 Compose 项目与独立容器
+        # 3a. 数据库应用级一致性热备 (MySQL / PostgreSQL / Redis)
+        if [ -n "$RUNNING_IDS" ]; then
+            for rcid in $RUNNING_IDS; do
+                rcname=$(docker inspect -f '{{.Name}}' "$rcid" 2>/dev/null | tr -d '/')
+                rcimg=$(docker inspect -f '{{.Config.Image}}' "$rcid" 2>/dev/null || true)
+
+                # MySQL / MariaDB
+                case "$rcname$rcimg" in
+                    *mysql*|*mariadb*|*MySQL*|*MariaDB*)
+                        log_info "检测到运行中的 MySQL/MariaDB 容器: $rcname ($rcimg)，正在执行一致性逻辑备份..."
+                        mpass=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$rcid" 2>/dev/null | grep -E '^(MYSQL_ROOT_PASSWORD|MARIADB_ROOT_PASSWORD)=' | head -n 1 | cut -d= -f2- || true)
+                        pwd_arg=""
+                        [ -n "$mpass" ] && pwd_arg="-p$mpass"
+                        dump_file="$DB_STORE/mysql_${rcname}.sql"
+                        if docker exec "$rcid" mysqldump -u root $pwd_arg --all-databases --single-transaction --quick > "$dump_file" 2>/dev/null; then
+                            log_info "MySQL 容器 $rcname 导出完成: $dump_file"
+                            d_kb=$(du -sk "$dump_file" 2>/dev/null | awk '{print $1}' || echo 0)
+                            TOTAL_NEED_KB=$((TOTAL_NEED_KB + d_kb))
+                        else
+                            log_warn "MySQL 容器 $rcname 自动 mysqldump 失败，容器数据将依赖 Named Volume/Bind Mount 冷备"
+                            rm -f "$dump_file"
+                        fi
+                        ;;
+                esac
+
+                # PostgreSQL
+                case "$rcname$rcimg" in
+                    *postgres*|*PostgreSQL*)
+                        log_info "检测到运行中的 PostgreSQL 容器: $rcname ($rcimg)，正在执行一致性逻辑备份..."
+                        dump_file="$DB_STORE/postgres_${rcname}.sql"
+                        if docker exec "$rcid" pg_dumpall -U postgres > "$dump_file" 2>/dev/null; then
+                            log_info "PostgreSQL 容器 $rcname 导出完成: $dump_file"
+                            d_kb=$(du -sk "$dump_file" 2>/dev/null | awk '{print $1}' || echo 0)
+                            TOTAL_NEED_KB=$((TOTAL_NEED_KB + d_kb))
+                        else
+                            log_warn "PostgreSQL 容器 $rcname 自动 pg_dumpall 失败，数据将依赖冷备"
+                            rm -f "$dump_file"
+                        fi
+                        ;;
+                esac
+
+                # Redis
+                case "$rcname$rcimg" in
+                    *redis*|*Redis*)
+                        log_info "检测到运行中的 Redis 容器: $rcname，正在触发 SAVE 刷新持久化..."
+                        docker exec "$rcid" redis-cli SAVE >/dev/null 2>&1 || docker exec "$rcid" redis-cli BGSAVE >/dev/null 2>&1 || true
+                        ;;
+                esac
+            done
+        fi
+
+        # 3b. 处理 Compose 项目与独立容器
         if [ -n "$C_IDS" ]; then
             for cid in $C_IDS; do
                 cname=$(docker inspect -f '{{.Name}}' "$cid" 2>/dev/null | tr -d '/')
@@ -556,13 +817,19 @@ EOF_REC
         if [ -f "metadata/containers_inspect.json" ]; then
             sha256sum metadata/containers_inspect.json >> sha256sums.txt
         fi
+        if [ -d "databases" ]; then
+            for dbf in databases/*.sql; do
+                [ -f "$dbf" ] || continue
+                sha256sum "$dbf" >> sha256sums.txt
+            done
+        fi
     )
 
     log_info "Docker 完整备份完成，校验清单位于: $TARGET_ABS/sha256sums.txt"
 }
 
 # -----------------------------------------------------------------------------
-# 2. 恢复子命令 (restore)
+# 3. 恢复子命令 (restore)
 # -----------------------------------------------------------------------------
 do_restore() {
     BACKUP_DIR=""
@@ -766,7 +1033,7 @@ do_restore() {
         done < "$COMPOSE_MANIFEST"
     fi
 
-    # 重建独立容器
+    # 10. 重建独立容器
     if [ -d "$BACKUP_DIR/standalone" ]; then
         STANDALONE_DIR="$BACKUP_DIR/standalone"
         for rscript in "$STANDALONE_DIR"/recreate_*.sh; do
@@ -779,154 +1046,16 @@ do_restore() {
         done
     fi
 
+    # 11. 检查是否存在导出的数据库文件，提示用户按需导入
+    if [ -d "$BACKUP_DIR/databases" ] && ls "$BACKUP_DIR/databases"/*.sql >/dev/null 2>&1; then
+        log_info "检测到备份中存在应用级数据库转储文件 ($BACKUP_DIR/databases/):"
+        for dbf in "$BACKUP_DIR/databases"/*.sql; do
+            [ -f "$dbf" ] && log_info "  - $(basename "$dbf")"
+        done
+        log_info "若需恢复数据库逻辑数据，请在容器稳定运行后执行对应 docker exec 导入。"
+    fi
+
     log_info "Docker 数据与服务已完整恢复成功！"
-}
-
-# -----------------------------------------------------------------------------
-# 3. 升级前唯一固件校验与双分区容量预检 (precheck_image)
-# -----------------------------------------------------------------------------
-do_precheck_image() {
-    IMAGE_PATH=""
-    EXPECTED_SHA=""
-
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            --image)
-                IMAGE_PATH="$2"
-                shift 2
-                ;;
-            --sha256)
-                EXPECTED_SHA="$2"
-                shift 2
-                ;;
-            --sys-root)
-                SYS_ROOT="$2"
-                shift 2
-                ;;
-            -*)
-                log_error "未知参数: $1"
-                exit 1
-                ;;
-            *)
-                if [ -z "$IMAGE_PATH" ]; then
-                    IMAGE_PATH="$1"
-                elif [ -z "$EXPECTED_SHA" ]; then
-                    EXPECTED_SHA="$1"
-                fi
-                shift
-                ;;
-        esac
-    done
-
-    if [ -z "$IMAGE_PATH" ]; then
-        log_error "必须传入固件镜像文件路径 (--image)"
-        exit 1
-    fi
-
-    if [ ! -f "$IMAGE_PATH" ]; then
-        log_error "固件文件不存在或匹配不唯一: $IMAGE_PATH"
-        exit 1
-    fi
-
-    IMG_SIZE=$(wc -c < "$IMAGE_PATH")
-    IMG_SIZE_MB=$((IMG_SIZE / 1024 / 1024))
-    log_info "固件文件确认: $IMAGE_PATH (大小: ${IMG_SIZE_MB}MB, ${IMG_SIZE} 字节)"
-
-    # 核对 SHA256 校验和
-    if [ -n "$EXPECTED_SHA" ]; then
-        require_cmd sha256sum
-        ACTUAL_SHA=$(sha256sum "$IMAGE_PATH" | awk '{print $1}')
-        if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
-            log_error "固件 SHA256 校验不匹配！预期: $EXPECTED_SHA，实际: $ACTUAL_SHA"
-            exit 1
-        fi
-        log_info "固件 SHA256 校验通过: $ACTUAL_SHA"
-    fi
-
-    # 检查固件机型与格式兼容性
-    require_cmd sysupgrade
-    log_info "执行 sysupgrade -T 格式与机型兼容性预检..."
-    if ! sysupgrade -T "$IMAGE_PATH"; then
-        log_error "固件与当前硬件平台不兼容，禁止刷入！"
-        exit 1
-    fi
-    log_info "固件平台兼容性校验通过"
-
-    # 检查目标分区容量（严格核验升级目标，绝不能盲目取两者中较大的一个）
-    require_cmd fdisk
-
-    MMC_DEV="/dev/mmcblk0"
-    PROC_CMDLINE="$(get_sys_path /proc/cmdline)"
-
-    FDISK_OUT=$(fdisk -l "$MMC_DEV" 2>/dev/null || true)
-    if [ -z "$FDISK_OUT" ]; then
-        log_error "无法读取 eMMC 分区表信息 ($MMC_DEV)，禁止盲刷！"
-        exit 1
-    fi
-
-    ACTIVE_ROOT=""
-    if [ -f "$PROC_CMDLINE" ]; then
-        ACTIVE_ROOT=$(grep -o 'root=[^ ]*' "$PROC_CMDLINE" | cut -d= -f2 || true)
-    fi
-
-    ROOTFS_SEC=$(echo "$FDISK_OUT" | grep -E "[[:space:]]rootfs[[:space:]]*$" | awk '{print $4}' || true)
-    ROOTFS1_SEC=$(echo "$FDISK_OUT" | grep -E "[[:space:]]rootfs_1[[:space:]]*$" | awk '{print $4}' || true)
-
-    if [ -z "$ROOTFS_SEC" ] && [ -z "$ROOTFS1_SEC" ]; then
-        ROOTFS_SEC=$(echo "$FDISK_OUT" | grep -w "rootfs" | awk '{print $4}' | head -n 1 || true)
-        ROOTFS1_SEC=$(echo "$FDISK_OUT" | grep -w "rootfs_1" | awk '{print $4}' | head -n 1 || true)
-    fi
-
-    if [ -z "$ROOTFS_SEC" ] && [ -z "$ROOTFS1_SEC" ]; then
-        log_error "未能在分区表中找到 rootfs/rootfs_1 分区信息，目标分区不明，禁止放行！"
-        exit 1
-    fi
-
-    TARGET_SEC=""
-    TARGET_PART=""
-    if [ -n "$ACTIVE_ROOT" ]; then
-        case "$ACTIVE_ROOT" in
-            *rootfs_1*)
-                TARGET_PART="rootfs (对侧待升级目标)"
-                TARGET_SEC="$ROOTFS_SEC"
-                ;;
-            *rootfs*)
-                TARGET_PART="rootfs_1 (对侧待升级目标)"
-                TARGET_SEC="$ROOTFS1_SEC"
-                ;;
-        esac
-    fi
-
-    # 若无法确定目标分区，取候选分区中较小者（严禁取大），确保安全边际
-    if [ -z "$TARGET_SEC" ]; then
-        if [ -n "$ROOTFS_SEC" ] && [ -n "$ROOTFS1_SEC" ]; then
-            if [ "$ROOTFS_SEC" -le "$ROOTFS1_SEC" ]; then
-                TARGET_SEC="$ROOTFS_SEC"
-                TARGET_PART="rootfs (较小分区)"
-            else
-                TARGET_SEC="$ROOTFS1_SEC"
-                TARGET_PART="rootfs_1 (较小分区)"
-            fi
-        elif [ -n "$ROOTFS_SEC" ]; then
-            TARGET_SEC="$ROOTFS_SEC"
-            TARGET_PART="rootfs"
-        else
-            TARGET_SEC="$ROOTFS1_SEC"
-            TARGET_PART="rootfs_1"
-        fi
-    fi
-
-    TARGET_BYTES=$((TARGET_SEC * 512))
-    TARGET_MB=$((TARGET_BYTES / 1024 / 1024))
-    log_info "核验目标升级分区 [$TARGET_PART] 扇区数: $TARGET_SEC (容量: ${TARGET_MB}MB)"
-
-    MIN_REQUIRED_BYTES=$((IMG_SIZE + 52428800))
-    MIN_REQUIRED_MB=$((MIN_REQUIRED_BYTES / 1024 / 1024))
-    if [ "$TARGET_BYTES" -le "$MIN_REQUIRED_BYTES" ]; then
-        log_error "目标分区容量 (${TARGET_MB}MB) 不足！刷入 ${IMG_SIZE_MB}MB 固件需至少 ${MIN_REQUIRED_MB}MB 空间以保留充足 overlay！"
-        exit 1
-    fi
-    log_info "目标分区容量安全校验通过 (${TARGET_MB}MB > ${MIN_REQUIRED_MB}MB)"
 }
 
 # -----------------------------------------------------------------------------
@@ -971,6 +1100,12 @@ do_clean_nss() {
         case "$SCRIPT_PATH" in
             /etc/firewall.d/qca-nss-ecm|/etc/firewall.d/qca-nss|/etc/firewall.nss|/etc/init.d/qca-nss-ecm)
                 log_info "确认属于已废弃旧版 NSS include 脚本 ($SCRIPT_PATH)，执行安全清理..."
+                # 备份旧防火墙配置以防万一（保留配置升级要求：备份后只清理对应遗留节）
+                if [ -f "$CONFIG_DIR_HOST/firewall" ]; then
+                    BAK_FW="$CONFIG_DIR_HOST/firewall.bak.$(date +%Y%m%d%H%M%S 2>/dev/null || echo 'old')"
+                    cp "$CONFIG_DIR_HOST/firewall" "$BAK_FW"
+                    log_info "已自动备份当前防火墙配置至: $BAK_FW"
+                fi
                 $UCI_CMD delete firewall.qcanssecm
                 $UCI_CMD commit firewall
                 [ -x "$INIT_FIREWALL" ] && "$INIT_FIREWALL" reload >/dev/null 2>&1 || true
@@ -987,6 +1122,7 @@ do_clean_nss() {
 
 # -----------------------------------------------------------------------------
 # 5. 升级后运行时验收 (verify_runtime)
+# 验收顺序：1) 网络连通性与 PassWall2 代理 -> 2) 软硬件加速 (PPE Flowtable) -> 3) Docker 网络与防火墙策略
 # -----------------------------------------------------------------------------
 do_verify_runtime() {
     CHECK_TARGET="all"
@@ -1010,7 +1146,91 @@ do_verify_runtime() {
 
     FAILED=0
 
-    # 1. 验证 PPE 硬件加速与 Flowtable
+    # 1. 验证网络连通性与 PassWall2 代理核心与握手
+    if [ "$CHECK_TARGET" = "all" ] || [ "$CHECK_TARGET" = "passwall" ]; then
+        log_info "=== 验证 PassWall2 代理核心与握手 ==="
+        PW_CORE=""
+        if pgrep -x sing-box >/dev/null 2>&1; then
+            PW_CORE="sing-box"
+        elif pgrep -x xray >/dev/null 2>&1; then
+            PW_CORE="xray"
+        fi
+
+        if [ -z "$PW_CORE" ]; then
+            log_error "PassWall2 核心进程 (sing-box / xray) 未在运行！"
+            FAILED=1
+        else
+            log_info "PassWall2 活动核心: $PW_CORE"
+            VAR_PW_DIR="$(get_sys_path /var/etc/passwall2)"
+            SOCKS_PORT=""
+            VALID_JSON=1
+
+            if [ -d "$VAR_PW_DIR" ]; then
+                for cfg in "$VAR_PW_DIR"/*.json; do
+                    [ -f "$cfg" ] || continue
+                    # 校验 JSON 语法
+                    if command -v jq >/dev/null 2>&1; then
+                        if ! jq empty "$cfg" >/dev/null 2>&1; then
+                            log_error "PassWall2 核心配置文件语法异常 ($cfg)！"
+                            VALID_JSON=0
+                        fi
+                    fi
+                    if [ -z "$SOCKS_PORT" ]; then
+                        PORT_MATCH=$(grep -o '"port": *[0-9]*' "$cfg" 2>/dev/null | head -n 1 | awk '{print $2}' || true)
+                        [ -n "$PORT_MATCH" ] && SOCKS_PORT="$PORT_MATCH"
+                    fi
+                done
+            fi
+
+            if [ "$VALID_JSON" -ne 1 ]; then
+                FAILED=1
+            fi
+
+            if [ -z "$SOCKS_PORT" ]; then
+                log_error "未能从实际配置中定位 PassWall2 SOCKS 端口 (禁止盲猜默认 1080)！"
+                FAILED=1
+            else
+                log_info "定位到活动核心 SOCKS 端口: $SOCKS_PORT"
+                if ! command -v curl >/dev/null 2>&1; then
+                    log_error "缺少 curl 工具，无法发起 SOCKS 代理握手测试！"
+                    FAILED=1
+                else
+                    # 真实 TLS 握手与连通性校验
+                    log_info "通过本地 SOCKS 端口 ($SOCKS_PORT) 发起真实 TLS 握手测试 (https://www.google.com)..."
+                    if curl --socks5-hostname "127.0.0.1:$SOCKS_PORT" -m 10 -s -I https://www.google.com >/dev/null 2>&1; then
+                        log_info "PassWall2 代理握手验证成功！"
+                    else
+                        log_error "PassWall2 代理握手失败，未能通过 SOCKS 端口建立 TLS 连接！(注: 单纯 Ping 无法证明 TLS 成功)"
+                        FAILED=1
+                    fi
+
+                    # 出口 IP 验证
+                    log_info "核验代理节点公网出口 IP..."
+                    EXIT_IP=$(curl --socks5-hostname "127.0.0.1:$SOCKS_PORT" -m 8 -s https://api.ipify.org 2>/dev/null || curl --socks5-hostname "127.0.0.1:$SOCKS_PORT" -m 8 -s http://icanhazip.com 2>/dev/null || true)
+                    if [ -n "$EXIT_IP" ]; then
+                        log_info "代理出口 IP 识别成功: $EXIT_IP"
+                    fi
+
+                    # 国内直连分流验证
+                    log_info "验证国内直连分流 (baidu.com)..."
+                    if curl -m 5 -s -I https://www.baidu.com >/dev/null 2>&1; then
+                        log_info "国内直连分流测试: 正常"
+                    else
+                        log_warn "国内直连访问超时，请核实 WAN 口 DNS 与路由"
+                    fi
+                fi
+
+                # 核心日志排查（排查 TLS 证书、鉴权或握手失败）
+                LOG_CHECK=$(logread -e passwall2 2>/dev/null || dmesg 2>/dev/null || true)
+                if echo "$LOG_CHECK" | grep -qiE "(handshake.*fail|certificate.*invalid|authentication.*fail|invalid.*user)"; then
+                    log_error "PassWall2 日志中检测到 TLS 握手或鉴权错误记录！"
+                    FAILED=1
+                fi
+            fi
+        fi
+    fi
+
+    # 2. 验证 PPE 硬件加速与 Flowtable
     if [ "$CHECK_TARGET" = "all" ] || [ "$CHECK_TARGET" = "ppe" ]; then
         log_info "=== 验证 PPE 硬件加速与 Flowtable ==="
         PPE_OK=0
@@ -1034,14 +1254,50 @@ do_verify_runtime() {
         fi
     fi
 
-    # 2. 验证 Docker 网络与端口转发
+    # 3. 验证 Docker 容器网络、防火墙后端与 WAN 边界策略
     if [ "$CHECK_TARGET" = "all" ] || [ "$CHECK_TARGET" = "docker" ]; then
-        log_info "=== 验证 Docker 容器出网与端口映射 ==="
+        log_info "=== 验证 Docker 容器网络、防火墙后端与端口映射 ==="
         if ! command -v docker >/dev/null 2>&1; then
             log_error "Docker 未安装或命令不可用！"
             FAILED=1
         else
-            # 2a. 出网 TCP / HTTP 测试
+            # 3a. 识别实际防火墙后端 (iptables-legacy / iptables-nft / nftables)
+            FW_BACKEND="unknown"
+            if command -v iptables >/dev/null 2>&1; then
+                IPT_VER=$(iptables -V 2>/dev/null || true)
+                if echo "$IPT_VER" | grep -qi "nf_tables"; then
+                    FW_BACKEND="iptables-nft (兼容层)"
+                elif echo "$IPT_VER" | grep -qi "legacy"; then
+                    FW_BACKEND="iptables-legacy"
+                else
+                    FW_BACKEND="iptables"
+                fi
+            elif command -v nft >/dev/null 2>&1; then
+                FW_BACKEND="nftables (原生)"
+            fi
+            log_info "检测到当前防火墙后端: $FW_BACKEND"
+
+            # 3b. 检查 filter / nat 表中的 Docker 链
+            CHAIN_FOUND=0
+            if command -v iptables >/dev/null 2>&1; then
+                if iptables -t filter -n -L DOCKER >/dev/null 2>&1 || iptables -t nat -n -L DOCKER >/dev/null 2>&1; then
+                    CHAIN_FOUND=1
+                    log_info "已确认 iptables filter/nat 表中的 DOCKER 链规则正常就绪"
+                fi
+            fi
+            if [ "$CHAIN_FOUND" -eq 0 ] && command -v nft >/dev/null 2>&1; then
+                if nft list tables 2>/dev/null | grep -qE "filter|nat|fw4"; then
+                    if nft list ruleset 2>/dev/null | grep -qi "docker"; then
+                        CHAIN_FOUND=1
+                        log_info "已确认 nftables 规则集中的 Docker 链规则正常就绪"
+                    fi
+                fi
+            fi
+            if [ "$CHAIN_FOUND" -eq 0 ]; then
+                log_warn "未能在防火墙 filter/nat 表中检测到 DOCKER 链，请确认 dockerd 已启用 iptables 支持"
+            fi
+
+            # 3c. 出网 TCP / HTTP 测试 (Egress)
             log_info "测试 Docker 容器外网出网 (TCP/HTTP)..."
             if docker run --rm alpine sh -c "wget -q -T 5 -O - http://connectivitycheck.gstatic.com/generate_204 || wget -q -T 5 -O - http://www.baidu.com" >/dev/null 2>&1; then
                 log_info "Docker 容器外网出网测试: 正常"
@@ -1050,7 +1306,7 @@ do_verify_runtime() {
                 FAILED=1
             fi
 
-            # 2b. 端口映射测试
+            # 3d. 端口映射测试
             log_info "测试 Docker 端口映射与 NAT 转发..."
             PORT_OK=0
             CID=$(docker run -d -p 127.0.0.1:18888:80 alpine sh -c "echo -e 'HTTP/1.1 200 OK\r\n\r\nPORT_OK' | nc -l -p 80" 2>/dev/null || true)
@@ -1067,53 +1323,18 @@ do_verify_runtime() {
                 log_error "Docker 端口映射验证失败！"
                 FAILED=1
             fi
-        fi
-    fi
 
-    # 3. 验证 PassWall2 节点与代理连通性
-    if [ "$CHECK_TARGET" = "all" ] || [ "$CHECK_TARGET" = "passwall" ]; then
-        log_info "=== 验证 PassWall2 代理核心与握手 ==="
-        PW_CORE=""
-        if pgrep -x sing-box >/dev/null 2>&1; then
-            PW_CORE="sing-box"
-        elif pgrep -x xray >/dev/null 2>&1; then
-            PW_CORE="xray"
-        fi
-
-        if [ -z "$PW_CORE" ]; then
-            log_error "PassWall2 核心进程 (sing-box / xray) 未在运行！"
-            FAILED=1
-        else
-            log_info "PassWall2 活动核心: $PW_CORE"
-            VAR_PW_DIR="$(get_sys_path /var/etc/passwall2)"
-            SOCKS_PORT=""
-            if [ -d "$VAR_PW_DIR" ]; then
-                for cfg in "$VAR_PW_DIR"/*.json; do
-                    [ -f "$cfg" ] || continue
-                    PORT_MATCH=$(grep -o '"port": *[0-9]*' "$cfg" 2>/dev/null | head -n 1 | awk '{print $2}' || true)
-                    if [ -n "$PORT_MATCH" ]; then
-                        SOCKS_PORT="$PORT_MATCH"
-                        break
-                    fi
-                done
+            # 3e. 核验 WAN 边界阻断策略 (确认 WAN 入站无法未经授权直连 Docker 端口)
+            log_info "核验 WAN 边界阻断策略..."
+            if command -v iptables >/dev/null 2>&1; then
+                FWD_POLICY=$(iptables -S FORWARD 2>/dev/null | head -n 1 || true)
+                if echo "$FWD_POLICY" | grep -qE -- "-P FORWARD (DROP|REJECT)"; then
+                    log_info "iptables FORWARD 默认策略为 DROP/REJECT，WAN 入站阻断安全"
+                fi
             fi
-
-            if [ -z "$SOCKS_PORT" ]; then
-                log_error "未能从实际配置中定位 PassWall2 SOCKS 端口 (禁止盲猜默认 1080)！"
-                FAILED=1
-            else
-                log_info "定位到活动核心 SOCKS 端口: $SOCKS_PORT"
-                if ! command -v curl >/dev/null 2>&1; then
-                    log_error "缺少 curl 工具，无法发起 SOCKS 代理握手测试！"
-                    FAILED=1
-                else
-                    log_info "通过本地 SOCKS 端口 ($SOCKS_PORT) 发起真实 TLS 握手测试..."
-                    if curl --socks5-hostname "127.0.0.1:$SOCKS_PORT" -m 10 -s -I https://www.google.com >/dev/null 2>&1; then
-                        log_info "PassWall2 代理握手验证成功！"
-                    else
-                        log_error "PassWall2 代理握手失败，未能通过 SOCKS 端口建立连接！"
-                        FAILED=1
-                    fi
+            if command -v nft >/dev/null 2>&1; then
+                if nft list chain inet fw4 forward 2>/dev/null | grep -qiE "drop|reject"; then
+                    log_info "nftables fw4 forward 包含 drop/reject 策略，WAN 边界阻断安全"
                 fi
             fi
         fi
@@ -1140,7 +1361,7 @@ case "${1:-}" in
         ;;
     precheck)
         shift
-        do_precheck_image "$@"
+        do_precheck "$@"
         ;;
     clean-nss)
         shift

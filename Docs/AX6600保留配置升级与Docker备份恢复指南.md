@@ -1,108 +1,216 @@
 # 京东云 AX6600 雅典娜 保留配置升级与 Docker 备份恢复指南
 
-本指南适用于京东云 AX6600（雅典娜 RE-CS-02）从旧版固件升级至 Linux 6.18 LTS（Qualcomm PPE + firewall4）固件。提供升级前容量体检、Docker 全量备份与恢复、NSS 遗留项清理及运行时验收命令。
+本指南适用于京东云 AX6600（雅典娜 RE-CS-02）从旧版固件升级至 Linux 6.18 LTS（Qualcomm PPE + firewall4）固件。提供升级前分区与存储体检、Docker 全量与数据库一致性备份、保留配置平滑升级、NSS 遗留项清理以及端到端功能验收规范。
 
 ---
 
 ## 一、升级前红线与只读检查
 
-### 1. 目标分区容量核对（严禁 60MB 原厂分区刷入 PLUS）
+在执行任何升级或备份操作前，请先在雅典娜路由器终端（SSH）执行以下只读检查，确认系统环境与硬件状态。
+
+### 1. 固件版本与硬件型号确认
 ```bash
-# 查看 eMMC rootfs 分区大小
+# 查看当前固件版本描述
+cat /etc/openwrt_release | grep DISTRIB_DESCRIPTION
+
+# 查看设备型号
+cat /tmp/sysinfo/model 2>/dev/null || cat /proc/device-tree/model 2>/dev/null
+```
+
+### 2. 目标升级分区与容量核查（严禁 60MB 原厂分区刷入 PLUS）
+雅典娜采用 eMMC 双系统分区设计（`rootfs` 与 `rootfs_1`），`sysupgrade` 升级时会将固件写入**当前非活动的对侧分区**。
+```bash
+# 1. 识别当前活动启动分区（例如 root=rootfs 或 root=rootfs_1）
+cat /proc/cmdline | grep -o 'root=[^ ]*'
+
+# 2. 查看 eMMC 分区表及对侧目标分区扇区容量
 fdisk -l /dev/mmcblk0 | grep -E "rootfs|rootfs_1"
 ```
-- **容量判定**：若待升级目标 `rootfs` 分区仅为 `60M` 或小于 `200M`，**严禁刷入 PLUS 版**（升级包解压后约 152.35MB，会溢出损坏）；请先刷入扩容分区表或选择 35MB 的 `PURE` 版。
-- 双分区机型必须确认实际待升级的对侧分区大小，绝不能盲目取两者中较大的一个。若分区为 `512M` 或更大，可安全刷入。
+- **容量红线判定**：
+  - 本次 PLUS 完整升级包约为 **152.04 MB**（解压刷入需占用对应分区大小）。
+  - 为保证系统启动后有足够的内部临时存储空间，待升级目标分区必须 **大于 200 MB**（如扩容后的 512MB 或 1024MB 分区）。
+  - 若待升级的对侧分区仅为 **60 MB**（未扩容的原厂双分区状态），**严禁刷入 PLUS 版**（会导致分区溢出变砖！），请先选择 30MB 的 `PURE` 纯净版，或使用 U-Boot 重新刷入扩容分区表。
+  - **重要原则**：绝不能根据整机 64GB/128GB eMMC 的总存储容量来判断能否刷入，必须精确核对待写入的目标分区实际大小；双分区机型绝不能盲目取两者中较大的一个。
 
-### 2. 单一镜像文件校验与机型预检
-定义唯一的 `IMAGE` 变量，拒绝通配符多匹配，并核对 SHA256 校验和：
+### 3. Docker 运行状态与存储介质归属排查
 ```bash
-IMAGE="/tmp/ones20250-owrt-plus-ipq60xx-jdcloud_re-cs-02-squashfs-sysupgrade-26.10.27-01.38.58.bin"
+# 查看 Docker 版本与存储驱动
+docker version --format '{{.Server.Version}}' 2>/dev/null || docker --version
+docker info -f '{{.Driver}}' 2>/dev/null
+
+# 必须在 dockerd 运行状态下探测真实 DockerRootDir（禁止盲猜默认路径）
+DOCKER_ROOT=$(docker info -f '{{.DockerRootDir}}' 2>/dev/null)
+echo "当前 DockerRootDir: $DOCKER_ROOT"
+
+# 查看 DockerRootDir 所在文件系统挂载点与设备类型
+df -h "$DOCKER_ROOT"
+mount | grep -E " / | /overlay "
+```
+
+#### 存储介质分类与风险等级：
+1. **内部 eMMC Overlay（高危！`mount` 显示设备为 `/dev/mmcblk0p*` 挂载在 `/overlay`）**：
+   > ⚠️ **底层原理**：OpenWrt 的 `sysupgrade` 机制在刷写 squashfs 固件时，**默认会擦除并重新格式化内部 flash 的 overlay 分区**！保留配置（`-c` 参数）仅仅是按 `/etc/sysupgrade.conf` 打包恢复指定的文本配置文件，**绝不等于保留整个 overlay**！
+   > 若 DockerRootDir 位于内部 overlay（如 `/overlay/docker`），直接升级将导致 Docker 镜像、Named Volumes 与容器可写层被彻底销毁！升级前必须完整导出到外部存储或 PC！
+2. **Extroot 外置 USB 存储（中危，`mount` 显示 `/dev/sd*` 挂载在 `/overlay`）**：
+   数据位于外置 U 盘/移动硬盘，但根文件系统依赖该外置存储，升级新内核后需防范挂载兼容性。
+3. **独立外部数据分区（推荐安全架构，`mount` 显示 `/dev/sd*` 挂载在 `/mnt/sda1` 等独立目录）**：
+   Docker 数据完全独立于系统根目录，不受固件刷写影响。但升级后**必须先确认存储挂载就绪，再启动 Docker**，避免 dockerd 在空挂载目录下重新初始化覆盖。
+
+### 4. 扫描现有卷（Volumes）与绑定挂载（Bind Mounts）
+```bash
+# 列出全部 Named Volumes
+docker volume ls
+
+# 列出所有容器的宿主机绑定挂载路径 (Bind Mounts)
+docker inspect --format '{{.Name}}: {{range .Mounts}}{{if eq .Type "bind"}}{{.Source}} -> {{.Destination}} {{end}}{{end}}' $(docker ps -aq) 2>/dev/null
+```
+
+### 5. 唯一固件文件校验与机型兼容性预检
+定义唯一的 `IMAGE` 变量，拒绝通配符匹配，并比对官方 Release SHA256 校验和：
+```bash
+# 以官方最新 PLUS 固件为例
+IMAGE="/tmp/ones20250-owrt-plus-ipq60xx-jdcloud_re-cs-02-squashfs-sysupgrade-26.10.27-20.11.54.bin"
+EXPECTED_SHA="bdd9f3c2a2aba88fd59f6d0891c0c5fecfd3aca83834ee38cfaea4d935d91865"
 
 [ ! -f "$IMAGE" ] && { echo "固件文件不存在: $IMAGE"; exit 1; }
-sha256sum "$IMAGE"
-sysupgrade -T "$IMAGE" || { echo "机型兼容性校验未通过，禁止刷入"; exit 1; }
-```
 
-### 3. Docker 路径与存储位置确认
-```bash
-# 必须在 dockerd 运行状态下探测真实 DockerRootDir，禁止猜测默认路径
-DOCKER_ROOT=$(docker info -f '{{.DockerRootDir}}' 2>/dev/null)
-[ -z "$DOCKER_ROOT" ] && { echo "无法获取 DockerRootDir，dockerd 未运行"; exit 1; }
+# 核对哈希
+ACTUAL_SHA=$(sha256sum "$IMAGE" | awk '{print $1}')
+if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+    echo "ERROR: 固件 SHA256 校验不匹配！预期: $EXPECTED_SHA, 实际: $ACTUAL_SHA"
+    exit 1
+fi
+echo "固件 SHA256 校验一致: $ACTUAL_SHA"
 
-echo "当前 DockerRootDir: $DOCKER_ROOT"
-df -h "$DOCKER_ROOT"
+# 机型兼容性预检（验证硬件平台与固件元数据兼容）
+sysupgrade -T "$IMAGE" || { echo "机型兼容性校验未通过，禁止刷入！"; exit 1; }
 ```
-> **注意**：`sysupgrade` 即使保留配置，内部 flash 的 `/overlay` 分区仍会被重置。若 DockerRootDir 位于 `/overlay`，升级会导致容器数据被清空，升级前必须导出备份到外部介质或电脑。
 
 ---
 
-## 二、Docker 全量备份流程（停机前导出元数据与配置）
+## 二、Docker 全量备份与数据库一致性导出
 
-备份工具使用项目内的 `Scripts/docker_upgrade_helper.sh`。备份目标必须是外部真实挂载介质（如 `/mnt/sda1`），空间充足且不在 `/overlay` 或 `/tmp` 内。
+为保证绝对数据安全，备份必须保存到外部独立挂载存储（如 `/mnt/sda1`）或通过 SSH 流式传输至个人电脑。**严禁把唯一备份保存在易失的 `/tmp`（内存盘）或升级后将被重置的内部 `/overlay` 中！严禁向内存中的 `/tmp` 打包数十 GB 的大体积 Docker 数据（会导致内存溢出 OOM 重启挂机）！**
 
-备份脚本会自动将自身复制到备份目录（`$TARGET_DIR/docker_upgrade_helper.sh`），保证升级重启后 `/tmp` 丢失时外部存储仍存有恢复工具。
+### 1. 数据库应用级逻辑热备（在停止容器前执行）
+如果你的 Docker 中运行有 MySQL、PostgreSQL 或 Redis 等数据库容器，在直接停止前应优先执行应用一致性导出，确保事务完全落盘：
 
-### 1. 路由器本地执行
 ```bash
-# 1. 将仓库 Scripts/docker_upgrade_helper.sh 上传至路由器 /tmp
+# MySQL / MariaDB 逻辑全备
+docker exec <mysql_container> mysqldump -u root -p<密码> --all-databases --single-transaction --quick > /mnt/sda1/mysql_all_backup.sql
+
+# PostgreSQL 逻辑全备
+docker exec <postgres_container> pg_dumpall -U postgres > /mnt/sda1/postgres_all_backup.sql
+
+# Redis 强制落盘
+docker exec <redis_container> redis-cli SAVE
+```
+
+### 2. 停机顺序与影响说明
+1. **影响**：停用容器与 dockerd 后，基于 Docker 运行的服务（如本地内网穿透、自建 DNS、媒体库等）将暂时下线；
+2. **操作顺序**：
+   - 步骤 ①：导出容器清单、inspect 元数据与 Compose 目录（含 `.env` 配置文件）；
+   - 步骤 ②：完成数据库应用级一致性导出；
+   - 步骤 ③：**临时禁用 dockerd 开机自启动**（避免升级首次开机在外盘未就绪时误在空目录初始化）；
+   - 步骤 ④：停止运行中的所有业务容器（保证存储块冷备一致性）；
+   - 步骤 ⑤：停止 dockerd 守护进程；
+   - 步骤 ⑥：打包归档 Named Volumes、Bind Mounts 与可写层快照；
+   - 步骤 ⑦：生成 SHA256 校验和清单，并进行归档可读性验证。
+
+### 3. 使用辅助脚本执行自动化备份
+项目提供了完善的 POSIX 兼容辅助工具 `Scripts/docker_upgrade_helper.sh`：
+```bash
+# 1. 上传或准备脚本
 chmod +x /tmp/docker_upgrade_helper.sh
 
-# 2. 执行备份（自动探测 Docker 路径、导出容器与 Compose 配置包括 .env、生成独立容器重建脚本、停机归档 Named Volumes 与 Bind Mounts、生成 SHA256 校验）
+# 2. 执行备份（指定外部挂载目标路径，如 /mnt/sda1/docker_backup_20261027）
 /tmp/docker_upgrade_helper.sh backup --target-dir /mnt/sda1/docker_backup_$(date +%Y%m%d)
 ```
+脚本会自动完成：
+- 探测并安全核对 `DockerRootDir` 挂载介质（拒绝 `/overlay` 和 `/tmp` 目标）；
+- 导出各 Compose 项目配置文件（包括隐藏 `.env` 文件）；
+- 自动检测 MySQL/MariaDB/Postgres 容器并执行一致性 dump；
+- 对有变动的独立容器提交快照镜像并生成重建命令；
+- 记录 Docker 原自启状态，升级前临时禁用自启动；
+- 优雅停止容器与 dockerd 服务；
+- 打包 Named Volumes 与宿主 Bind Mounts，生成 `sha256sums.txt`；
+- 自动将恢复辅助脚本复制一份至备份介质根目录，确保重启后脱机可用。
 
-### 2. 跨平台 SSH 远程触发单行命令（确保变量在路由器端解析）
+### 4. 远程 SSH 流式备份至电脑（无路由器外挂盘时的方案）
+若路由器未连接外部移动硬盘，可直接在电脑终端通过 SSH 管道将归档数据直接写入电脑本地硬盘：
 
-#### Linux / macOS 终端
+#### Linux / macOS 电脑终端：
 ```bash
-ssh root@192.168.1.1 'sh -c "
-set -e
-TARGET=/mnt/sda1/docker_backup_\$(date +%Y%m%d)
-/tmp/docker_upgrade_helper.sh backup --target-dir \"\$TARGET\"
-"'
+ssh root@192.168.1.1 '
+    set -e
+    DOCKER_ROOT=$(docker info -f "{{.DockerRootDir}}")
+    /etc/init.d/dockerd stop
+    tar -cz -C "$DOCKER_ROOT" volumes
+' > ~/Desktop/athena_docker_volumes_$(date +%Y%m%d).tar.gz
+
+# 校验电脑端归档完整性
+tar -tzvf ~/Desktop/athena_docker_volumes_*.tar.gz | head -20
 ```
 
-#### Windows PowerShell 终端
+#### Windows PowerShell 电脑终端：
 ```powershell
-$cmd = @'
-set -e
-TARGET=/mnt/sda1/docker_backup_$(date +%Y%m%d)
-/tmp/docker_upgrade_helper.sh backup --target-dir "$TARGET"
-'@
-ssh root@192.168.1.1 "sh -c '$cmd'"
+$cmd = 'DOCKER_ROOT=$(docker info -f "{{.DockerRootDir}}"); /etc/init.d/dockerd stop; tar -cz -C "$DOCKER_ROOT" volumes'
+ssh root@192.168.1.1 "sh -c '$cmd'" > "C:\Athena_Backup\docker_volumes_$(Get-Date -Format 'yyyyMMdd').tar.gz"
+
+# 检查归档可读性
+tar -tzvf "C:\Athena_Backup\docker_volumes_*.tar.gz" | Select-Object -First 20
 ```
 
 ---
 
-## 三、保留配置刷入与 NSS 遗留项清理
+## 三、保留配置平滑升级与 NSS 遗留项精准清理
 
 ### 1. 执行保留配置刷入
+在确认升级前检查全部通过且备份已妥善保存后，执行升级：
 ```bash
-IMAGE="/tmp/ones20250-owrt-plus-ipq60xx-jdcloud_re-cs-02-squashfs-sysupgrade-26.10.27-01.38.58.bin"
+IMAGE="/tmp/ones20250-owrt-plus-ipq60xx-jdcloud_re-cs-02-squashfs-sysupgrade-26.10.27-20.11.54.bin"
 sysupgrade -c -v "$IMAGE"
 ```
+系统将保留现有网络、Wi-Fi、DHCP、防火墙及用户自定义规则并自动重启。
 
-### 2. 重启后清理废弃 NSS 防火墙配置
-系统重启后，检查并清理失效的 NSS 钩子（核对节类型为 `include` 且脚本路径精确匹配旧版脚本，严禁删除同名 rule、redirect 或自定义 include）：
+### 2. 首次启动与安全接管原则
+- 首次开机进入系统后，**绝对不要立即手动启动 dockerd**！
+- 必须先确认外部存储设备已被内核识别并正确挂载到了既定目录。
+
+### 3. 精准清理 NSS 专用失效条目（严禁覆盖整份防火墙配置）
+因新固件迁移至 Linux 6.18 LTS 并采用开源 PPE 硬件加速，旧固件中残留的闭源 NSS 防火墙 include 钩子已失效。**升级方案严禁为了启用 PPE 而直接覆盖或重置用户的整份旧防火墙配置！** 必须在备份后仅精准清理确认失效的 NSS 节：
+
 ```bash
-# 直接使用备份盘中的 helper 执行清理
+# 推荐使用备份盘中随附的 helper 执行（自动备份旧配置并精准清理）
 /mnt/sda1/docker_backup_*/docker_upgrade_helper.sh clean-nss
 ```
-或直接通过 UCI 核对后清理：
+
+或手动执行审查与清理：
 ```bash
+# 1. 检查是否存在 firewall.qcanssecm
 if uci -q get firewall.qcanssecm >/dev/null; then
     SEC_TYPE=$(uci -q get firewall.qcanssecm || true)
     SCRIPT_PATH=$(uci -q get firewall.qcanssecm.path || true)
+    
+    # 严格核对：节类型必须为 include，且路径严格匹配已废弃的旧 NSS 脚本
     if [ "$SEC_TYPE" = "include" ]; then
         case "$SCRIPT_PATH" in
-            /etc/firewall.d/qca-nss-ecm|/etc/firewall.d/qca-nss|/etc/firewall.nss)
-                echo "清理废弃 NSS 钩子: firewall.qcanssecm"
+            /etc/firewall.d/qca-nss-ecm|/etc/firewall.d/qca-nss|/etc/firewall.nss|/etc/init.d/qca-nss-ecm)
+                echo "发现废弃 NSS 防火墙钩子 ($SCRIPT_PATH)，正在备份并安全清理..."
+                # 备份旧配置
+                cp /etc/config/firewall /etc/config/firewall.bak.$(date +%Y%m%d%H%M%S)
+                # 仅删除该废弃条目
                 uci delete firewall.qcanssecm
                 uci commit firewall
                 /etc/init.d/firewall reload
+                echo "NSS 废弃 include 项清理完成，所有用户自定义规则与端口转发已完好保留。"
+                ;;
+            *)
+                echo "firewall.qcanssecm 指向未知脚本 ($SCRIPT_PATH)，保留不做修改。"
                 ;;
         esac
+    else
+        echo "firewall.qcanssecm 属于非 include 规则（如用户同名 rule），严禁删除！"
     fi
 fi
 ```
@@ -111,81 +219,152 @@ fi
 
 ## 四、Docker 完整恢复流程
 
-升级完成后，先确认外部数据盘已真实挂载，使用备份目录中的 helper 执行恢复（不依赖升级前的临时文件或旧环境变量）：
-
+### 1. 核对外部数据盘挂载
 ```bash
-# 1. 确认外置存储挂载（不能只看路径存在，必须核对挂载点与设备）
+# 确认外置存储挂载点与设备真实就绪（不能仅检查目录存在）
 df -h | grep /mnt/sda1 || mount /mnt/sda1
+```
 
-# 2. 执行完整数据与服务恢复
-# 自动校验 sha256sums.txt，恢复配置与 data-root，释放 volumes 与 bind mounts 至宿主原路径，仅拉起记录的项目并按原记录恢复自启
+### 2. 执行数据还原与服务恢复
+使用备份目录中的 helper 脚本执行恢复（不依赖任何升级前的旧临时变量）：
+```bash
 /mnt/sda1/docker_backup_*/docker_upgrade_helper.sh restore \
     --backup-dir /mnt/sda1/docker_backup_20261027 \
     --target-data-root /mnt/sda1/docker_data
 ```
+还原流程包括：
+- 严格校验 `sha256sums.txt`，确保归档未发生位翻转或损坏；
+- 确认目标 DataRoot 挂载安全，严禁解压到内部 `/overlay`；
+- 恢复 `/etc/config/dockerd` 与 `/etc/docker/daemon.json` 配置，自动同步更新 `data_root` 路径；
+- 解压释放 Named Volumes 与 Bind Mounts 至宿主机原路径；
+- 启动 dockerd 守护进程并按原有状态恢复开机自启；
+- 仅拉起本次升级记录的 Compose 编排项目，重建独立容器；
+- 若存在 SQL 备份文件，按需导入对应数据库。
 
 ---
 
-## 五、升级后运行时验收
+## 五、升级后核心功能验收与排错方法
 
-升级与数据恢复后，运行以下验收命令核实核心功能：
+按照 **1. 网络与代理** $\rightarrow$ **2. 软硬件加速** $\rightarrow$ **3. Docker 与防火墙边界** 的严格顺序进行端到端验收。
 
 ```bash
-# 推荐使用 helper 统一验收
+# 推荐使用 helper 统一全量验收
 /mnt/sda1/docker_backup_*/docker_upgrade_helper.sh verify all
 ```
 
 或手动执行分步验收：
 
+### 1. 网络连通性与 PassWall2 节点平滑继承核验
+
+#### ① 检查继承的旧节点配置结构
 ```bash
-# 1. 验证 PPE 硬件加速与 Flowtable
-if nft list tables | grep -q "flowtable"; then
-    echo "PPE Flowtable 卸载已生效"
-else
-    echo "ERROR: PPE Flowtable 未生效" >&2
-    exit 1
+# 检查旧节点数据结构、加密类型与协议
+uci show passwall2 | grep -E "\.type=|\.protocol=|\.address=|\.port="
+```
+
+#### ② 最小平滑迁移策略（若核心升级导致旧节点不兼容时）
+如果发现旧节点无法读取或核心报错，按以下最小迁移原则在 Web 界面重新录入：
+- **提取并保留关键要素**：服务器域名/IP（`address`）、服务端口（`port`）、用户凭据（`uuid` / `password`）、传输协议（`transport`：如 ws/grpc/tcp）、TLS 参数（`tls` / `sni` / `alpn` / `fingerprint`）；
+- **选择现代化核心**：在新版界面中首选 `sing-box` 或 `Xray`，以相同凭据新建同类节点，保留原分流语义。
+
+#### ③ 核心配置文件语法与进程审查
+```bash
+# 确认核心进程处于运行状态
+pgrep -x sing-box || pgrep -x xray
+
+# 检查实际生成的 JSON 客户端配置语法
+for cfg in /var/etc/passwall2/*.json; do
+    [ -f "$cfg" ] || continue
+    if command -v jq >/dev/null; then
+        jq empty "$cfg" && echo "配置语法验证通过: $cfg"
+    fi
+done
+```
+
+#### ④ 真实代理网络与 TLS 握手鉴权核验
+> [!CAUTION]
+> **真实性警告**：单纯的 TCP Ping 或 HTTP 延时测试**绝不能证明** TLS 握手、用户认证与节点流量解密成功！Ping 仅能证明网络路由可达，握手失败时依然可能显示低延迟！
+
+必须通过指定本地 SOCKS 端口进行带 TLS 握手的 HTTPS 深度请求与出口 IP 核验：
+```bash
+# 1. 自动定位活动核心的实际本地 SOCKS 端口（禁止盲猜默认 1080）
+SOCKS_PORT=""
+for cfg in /var/etc/passwall2/*.json; do
+    [ -f "$cfg" ] || continue
+    PORT_MATCH=$(grep -o '"port": *[0-9]*' "$cfg" | head -n 1 | awk '{print $2}')
+    [ -n "$PORT_MATCH" ] && { SOCKS_PORT="$PORT_MATCH"; break; }
+done
+echo "PassWall2 活动核心 SOCKS 端口: $SOCKS_PORT"
+
+# 2. 发起真实 TLS 握手深度请求
+curl --socks5-hostname "127.0.0.1:$SOCKS_PORT" -m 10 -s -I https://www.google.com
+
+# 3. 核验当前代理公网出口 IP（必须与代理节点出口一致）
+curl --socks5-hostname "127.0.0.1:$SOCKS_PORT" -m 10 -s https://api.ipify.org && echo ""
+
+# 4. 验证国内直连分流是否穿透正常（直连百度）
+curl -m 5 -s -I https://www.baidu.com
+
+# 5. 检查核心日志，确认无 TLS Handshake Failed 或 Invalid User 报错
+logread -e passwall2 | tail -n 25
+```
+
+---
+
+### 2. 软硬件加速与 PPE Flowtable 卸载核对
+
+```bash
+# 1. 验证内核 Flowtable 流表卸载规则
+nft list tables | grep -q "flowtable" && echo "Flowtable 硬件流表: 已生效"
+
+# 2. 检查内核日志是否存在 PPE 驱动初始化报错
+dmesg | grep -qiE "(ppe|flowtable).*(fail|error|disabled)" && echo "警告: PPE 驱动存在报错" || echo "PPE 驱动就绪: 无报错"
+```
+
+---
+
+### 3. Docker 防火墙后端与网络链路端到端验收
+
+#### ① 识别实际防火墙后端与链检查
+> [!WARNING]
+> OpenWrt 上的 Docker 守护进程通常通过 `iptables-nft` 兼容层与 Linux 内核交互。**绝对不能硬编码 `nft list chain inet fw4 DOCKER` 作为唯一判断依据**！
+
+```bash
+# 1. 识别当前防火墙后端类型
+if command -v iptables >/dev/null 2>&1; then
+    iptables -V
+    echo "=== 检查 iptables filter 表与 nat 表中的 DOCKER 链 ==="
+    iptables -t filter -n -L DOCKER 2>/dev/null | head -10 || true
+    iptables -t nat -n -L DOCKER 2>/dev/null | head -10 || true
 fi
 
-# 2. 验证 Docker 容器出网与端口转发
-if docker run --rm alpine sh -c "wget -q -T 5 -O - http://connectivitycheck.gstatic.com/generate_204 || wget -q -T 5 -O - http://www.baidu.com" >/dev/null 2>&1; then
-    echo "Docker 容器出网正常"
-else
-    echo "ERROR: Docker 容器网络出网异常" >&2
-    exit 1
+if command -v nft >/dev/null 2>&1; then
+    echo "=== 检查 nftables 相关规则集 ==="
+    nft list ruleset 2>/dev/null | grep -i "chain docker" || true
 fi
+```
 
+#### ② 容器端到端网络验收（出网、端口映射与 WAN 边界防护）
+```bash
+# 1. 验证容器出网能力 (Egress)
+docker run --rm alpine sh -c "wget -q -T 5 -O - http://connectivitycheck.gstatic.com/generate_204 || wget -q -T 5 -O - http://www.baidu.com" >/dev/null
+echo "容器出网能力: 正常"
+
+# 2. 验证 LAN 侧端口映射与 NAT 回流 (Ingress / Loopback)
 CID=$(docker run -d -p 127.0.0.1:18888:80 alpine sh -c "echo -e 'HTTP/1.1 200 OK\r\n\r\nPORT_OK' | nc -l -p 80")
 sleep 1
 RESP=$(curl -m 3 -s http://127.0.0.1:18888 || true)
 docker rm -f "$CID" >/dev/null 2>&1 || true
-if ! echo "$RESP" | grep -q "PORT_OK"; then
-    echo "ERROR: Docker 端口映射转发异常" >&2
-    exit 1
-fi
-echo "Docker 端口映射转发正常"
-
-# 3. 验证 PassWall2 实际代理核心与真实握手
-PW_CORE=""
-pgrep -x sing-box >/dev/null && PW_CORE="sing-box"
-pgrep -x xray >/dev/null && PW_CORE="xray"
-
-if [ -n "$PW_CORE" ]; then
-    echo "PassWall2 活动核心: $PW_CORE"
-    SOCKS_PORT=""
-    for cfg in /var/etc/passwall2/*.json; do
-        [ -f "$cfg" ] || continue
-        PORT_FOUND=$(grep -o '"port": *[0-9]*' "$cfg" | head -n 1 | awk '{print $2}' || true)
-        [ -n "$PORT_FOUND" ] && { SOCKS_PORT="$PORT_FOUND"; break; }
-    done
-    [ -z "$SOCKS_PORT" ] && { echo "ERROR: 无法定位 PassWall2 实际 SOCKS 端口" >&2; exit 1; }
-    echo "活动核心本地 SOCKS 端口: $SOCKS_PORT"
-    curl --socks5-hostname "127.0.0.1:$SOCKS_PORT" -m 10 -s -I https://www.google.com >/dev/null || {
-        echo "ERROR: PassWall2 真实代理握手失败" >&2
-        exit 1
-    }
-    echo "PassWall2 代理连通正常"
+if echo "$RESP" | grep -q "PORT_OK"; then
+    echo "LAN 访问容器映射端口: 正常"
 else
-    echo "ERROR: PassWall2 核心未运行" >&2
+    echo "ERROR: 端口映射与 NAT 回流异常！" >&2
     exit 1
 fi
+
+# 3. 验证 WAN 边界阻断策略 (WAN Ingress Block)
+# 确认防火墙 FORWARD 默认策略为 DROP/REJECT，外部未授权流量无法绕过路由器直接攻击容器端口
+iptables -S FORWARD 2>/dev/null | head -n 3
 ```
+
+若上述各项指标均通过，则京东云 AX6600 雅典娜保留配置升级与 Docker 恢复全部验收完毕！
